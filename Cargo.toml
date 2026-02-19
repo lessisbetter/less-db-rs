@@ -1,0 +1,24 @@
+[package]
+name = "less-db"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local-first document store with CRDT sync, schema migrations, and reactive queries"
+
+[dependencies]
+json-joy = { path = "/Users/nchapman/Code/json-joy-rs/crates/json-joy" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2.0"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+base64 = "0.22"
+parking_lot = "0.12"
+tracing = "0.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
