@@ -90,6 +90,12 @@ pub struct BulkDeleteResult {
     pub deleted_ids: Vec<String>,
     pub errors: Vec<RecordError>,
 }
+/// Result of a query operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryResult {
+    pub records: Vec<SerializedRecord>,
+    pub total: Option<usize>,
+}
 
 /// Result of bulk patch
 #[derive(Debug, Clone, Serialize, Deserialize)]
