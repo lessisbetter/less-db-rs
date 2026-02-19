@@ -1,5 +1,5 @@
 use json_joy::json_crdt::codec::structural::binary;
-use json_joy::json_crdt::nodes::{IndexExt, TsKey};
+use json_joy::json_crdt::nodes::TsKey;
 use json_joy::json_crdt::Model;
 use json_joy::json_crdt::ModelApi;
 use json_joy::json_crdt_diff::diff_node;

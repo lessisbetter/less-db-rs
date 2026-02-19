@@ -1,1 +1,400 @@
+pub mod patch_log;
 
+use json_joy::json_crdt::codec::structural::binary;
+use json_joy::json_crdt::nodes::TsKey;
+use json_joy::json_crdt::Model;
+use json_joy::json_crdt::ModelApi;
+use json_joy::json_crdt_diff::diff_node;
+use json_joy::json_crdt_patch::Patch;
+use serde_json::Value;
+
+use crate::error::{LessDbError, Result};
+
+/// Minimum session ID (json-joy requirement: sid >= 0x10000)
+pub const MIN_SESSION_ID: u64 = 65536;
+
+/// Maximum CRDT binary size (10 MB)
+pub const MAX_CRDT_BINARY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Generate a random session ID (>= MIN_SESSION_ID).
+///
+/// Uses the same approach as json-joy-rs `Model::create()` internally:
+/// combines system time components for entropy, then ensures the result
+/// meets the minimum SID requirement.
+pub fn generate_session_id() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // Combine seconds (upper bits) and nanos (lower 30 bits) for entropy,
+    // matching the approach used in json-joy-rs Model::create().
+    let seed = (d.as_secs() << 30) ^ (d.subsec_nanos() as u64);
+    seed.wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+        | MIN_SESSION_ID
+}
+
+/// Validate that a session ID meets json-joy requirements.
+pub fn is_valid_session_id(sid: u64) -> bool {
+    sid >= MIN_SESSION_ID
+}
+
+/// Create a new Model initialized with JSON data.
+///
+/// The model is created with the given session ID and the provided data
+/// is set as the root value via `ModelApi`.
+pub fn create_model(data: &Value, session_id: u64) -> Result<Model> {
+    let mut model = Model::new(session_id);
+    {
+        let mut api = ModelApi::new(&mut model);
+        api.set_root(data)
+            .map_err(|e| LessDbError::Crdt(format!("set_root failed: {:?}", e)))?;
+        api.apply();
+    }
+    Ok(model)
+}
+
+/// Diff a model's current view against new data.
+///
+/// Returns `Some(patch)` if there are changes, or `None` if the model's
+/// view already matches `new_data`.
+pub fn diff_model(model: &Model, new_data: &Value) -> Option<Patch> {
+    // If the root has never been set, there is nothing to diff against.
+    let root_node = model.index.get(&TsKey::from(model.root.val))?;
+    diff_node(
+        root_node,
+        &model.index,
+        model.clock.sid,
+        model.clock.time,
+        new_data,
+    )
+}
+
+/// Apply a patch to a model (mutates in place).
+pub fn apply_patch(model: &mut Model, patch: &Patch) {
+    model.apply_patch(patch);
+}
+
+/// Get the JSON view of a model.
+pub fn view_model(model: &Model) -> Value {
+    model.view()
+}
+
+/// Fork a model: encode to binary, decode, then assign a new session ID.
+///
+/// The forked model shares the same CRDT history but can diverge independently
+/// under the new session ID. The new session's clock starts at the current
+/// logical time so it will never issue timestamps that conflict with the
+/// original session.
+pub fn fork_model(model: &Model, session_id: u64) -> Result<Model> {
+    let bytes = binary::encode(model);
+    let mut forked =
+        binary::decode(&bytes).map_err(|e| LessDbError::Crdt(format!("fork decode: {:?}", e)))?;
+
+    // Re-assign the session ID and update the clock so the fork issues
+    // timestamps that are distinct from the original session.
+    let old_time = forked.clock.time;
+    forked.clock = forked.clock.fork(session_id);
+    // Ensure the forked clock's local time is at least as far ahead as before.
+    if forked.clock.time < old_time {
+        forked.clock.time = old_time;
+    }
+
+    Ok(forked)
+}
+
+/// Serialize a model to binary.
+pub fn model_to_binary(model: &Model) -> Vec<u8> {
+    binary::encode(model)
+}
+
+/// Deserialize a model from binary.
+///
+/// Returns an error if the binary exceeds `MAX_CRDT_BINARY_SIZE` or cannot
+/// be decoded.
+pub fn model_from_binary(data: &[u8]) -> Result<Model> {
+    if data.len() > MAX_CRDT_BINARY_SIZE {
+        return Err(LessDbError::Crdt(format!(
+            "CRDT binary too large: {} bytes (max {})",
+            data.len(),
+            MAX_CRDT_BINARY_SIZE
+        )));
+    }
+    binary::decode(data).map_err(|e| LessDbError::Crdt(format!("decode failed: {:?}", e)))
+}
+
+/// Load a model from binary with a specific session ID.
+///
+/// Equivalent to `model_from_binary` followed by assigning the session ID to
+/// the model's clock, so the model can issue locally-unique timestamps.
+pub fn model_load(data: &[u8], session_id: u64) -> Result<Model> {
+    let mut model = model_from_binary(data)?;
+    let old_time = model.clock.time;
+    model.clock = model.clock.fork(session_id);
+    if model.clock.time < old_time {
+        model.clock.time = old_time;
+    }
+    Ok(model)
+}
+
+/// Merge pending patches into a remote model.
+///
+/// CRDT patches are idempotent — operations that the remote model has already
+/// seen (via its clock vector) are safely applied again without corruption.
+pub fn merge_with_pending_patches(remote_model: &mut Model, pending_patches: &[Patch]) {
+    for patch in pending_patches {
+        remote_model.apply_patch(patch);
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── Session ID ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn generate_session_id_is_valid() {
+        let sid = generate_session_id();
+        assert!(
+            sid >= MIN_SESSION_ID,
+            "generated SID {sid} is below minimum {MIN_SESSION_ID}"
+        );
+    }
+
+    #[test]
+    fn is_valid_session_id_accepts_minimum() {
+        assert!(is_valid_session_id(MIN_SESSION_ID));
+    }
+
+    #[test]
+    fn is_valid_session_id_accepts_large_value() {
+        assert!(is_valid_session_id(u64::MAX));
+    }
+
+    #[test]
+    fn is_valid_session_id_rejects_below_minimum() {
+        assert!(!is_valid_session_id(0));
+        assert!(!is_valid_session_id(1));
+        assert!(!is_valid_session_id(MIN_SESSION_ID - 1));
+    }
+
+    // ── create_model / view_model ────────────────────────────────────────────
+
+    #[test]
+    fn create_model_view_matches_data() {
+        let data = json!({"name": "Alice", "age": 30});
+        let model = create_model(&data, MIN_SESSION_ID).expect("create_model should succeed");
+        let view = view_model(&model);
+        assert_eq!(view["name"], json!("Alice"));
+        assert_eq!(view["age"], json!(30));
+    }
+
+    #[test]
+    fn create_model_with_nested_data() {
+        let data = json!({"outer": {"inner": 42}});
+        let model = create_model(&data, MIN_SESSION_ID).expect("create_model should succeed");
+        let view = view_model(&model);
+        assert_eq!(view["outer"]["inner"], json!(42));
+    }
+
+    #[test]
+    fn create_model_with_array_data() {
+        let data = json!([1, 2, 3]);
+        let model = create_model(&data, MIN_SESSION_ID).expect("create_model should succeed");
+        let view = view_model(&model);
+        assert_eq!(view, json!([1, 2, 3]));
+    }
+
+    // ── diff_model ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn diff_model_returns_none_when_unchanged() {
+        let data = json!({"x": 1});
+        let model = create_model(&data, MIN_SESSION_ID).expect("create_model should succeed");
+        let patch = diff_model(&model, &data);
+        assert!(
+            patch.is_none(),
+            "diff against identical data should return None"
+        );
+    }
+
+    #[test]
+    fn diff_model_returns_patch_when_changed() {
+        let initial = json!({"score": 10});
+        let mut model =
+            create_model(&initial, MIN_SESSION_ID).expect("create_model should succeed");
+        let updated = json!({"score": 20});
+        let patch = diff_model(&model, &updated);
+        assert!(patch.is_some(), "diff against changed data should return Some");
+
+        // Apply the patch and verify the view updated.
+        if let Some(p) = patch {
+            apply_patch(&mut model, &p);
+        }
+        assert_eq!(view_model(&model)["score"], json!(20));
+    }
+
+    // ── apply_patch ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_patch_modifies_model() {
+        let initial = json!({"value": "before"});
+        let mut model =
+            create_model(&initial, MIN_SESSION_ID).expect("create_model should succeed");
+
+        let updated = json!({"value": "after"});
+        if let Some(patch) = diff_model(&model, &updated) {
+            apply_patch(&mut model, &patch);
+        }
+
+        assert_eq!(view_model(&model)["value"], json!("after"));
+    }
+
+    // ── model_to_binary / model_from_binary ──────────────────────────────────
+
+    #[test]
+    fn binary_round_trip_preserves_view() {
+        let data = json!({"key": "value", "num": 42});
+        let model = create_model(&data, MIN_SESSION_ID).expect("create_model should succeed");
+
+        let bytes = model_to_binary(&model);
+        assert!(!bytes.is_empty(), "binary should be non-empty");
+
+        let restored = model_from_binary(&bytes).expect("model_from_binary should succeed");
+        let view = view_model(&restored);
+        assert_eq!(view["key"], json!("value"));
+        assert_eq!(view["num"], json!(42));
+    }
+
+    #[test]
+    fn model_from_binary_rejects_oversized_input() {
+        // Create a buffer that exceeds the size limit.
+        let oversized = vec![0u8; MAX_CRDT_BINARY_SIZE + 1];
+        let result = model_from_binary(&oversized);
+        assert!(
+            result.is_err(),
+            "model_from_binary should reject oversized input"
+        );
+        match result.unwrap_err() {
+            LessDbError::Crdt(msg) => {
+                assert!(msg.contains("too large"), "error message: {msg}");
+            }
+            other => panic!("expected Crdt error, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn model_from_binary_rejects_empty_input() {
+        // An empty slice is definitively invalid and the decoder returns Err gracefully.
+        let result = model_from_binary(&[]);
+        assert!(result.is_err(), "empty input should produce an error");
+    }
+
+    #[test]
+    fn model_from_binary_rejects_short_input() {
+        // 3-byte input is too short for the 4-byte clock-table-offset header
+        // in the logical-clock path and returns Err gracefully.
+        let result = model_from_binary(&[0x00, 0x00, 0x00]);
+        assert!(result.is_err(), "3-byte input should produce an error");
+    }
+
+    // ── model_load ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn model_load_assigns_session_id() {
+        let data = json!({"x": 1});
+        let original = create_model(&data, MIN_SESSION_ID).expect("create_model should succeed");
+        let bytes = model_to_binary(&original);
+
+        let new_sid = MIN_SESSION_ID + 1000;
+        let loaded = model_load(&bytes, new_sid).expect("model_load should succeed");
+        assert_eq!(
+            loaded.clock.sid, new_sid,
+            "loaded model should have the requested session ID"
+        );
+        assert_eq!(view_model(&loaded), json!({"x": 1}));
+    }
+
+    // ── fork_model ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn fork_model_creates_independent_copy() {
+        let data = json!({"x": 1});
+        let original =
+            create_model(&data, MIN_SESSION_ID).expect("create_model should succeed");
+
+        let fork_sid = MIN_SESSION_ID + 500;
+        let mut forked = fork_model(&original, fork_sid).expect("fork_model should succeed");
+
+        // Original view is unchanged.
+        assert_eq!(view_model(&original), json!({"x": 1}));
+
+        // Modify the fork.
+        let updated = json!({"x": 2});
+        if let Some(patch) = diff_model(&forked, &updated) {
+            apply_patch(&mut forked, &patch);
+        }
+
+        // Fork reflects the change; original does not.
+        assert_eq!(view_model(&forked)["x"], json!(2));
+        assert_eq!(view_model(&original)["x"], json!(1));
+    }
+
+    #[test]
+    fn fork_model_has_requested_session_id() {
+        let data = json!({"v": 0});
+        let original = create_model(&data, MIN_SESSION_ID).expect("create_model should succeed");
+
+        let fork_sid = MIN_SESSION_ID + 9999;
+        let forked = fork_model(&original, fork_sid).expect("fork_model should succeed");
+        assert_eq!(forked.clock.sid, fork_sid);
+    }
+
+    // ── merge_with_pending_patches ───────────────────────────────────────────
+
+    #[test]
+    fn merge_with_pending_patches_applies_in_order() {
+        let initial = json!({"counter": 0});
+        let mut local =
+            create_model(&initial, MIN_SESSION_ID).expect("create_model should succeed");
+
+        // Snapshot the initial state — the remote starts from the same binary.
+        let initial_bytes = model_to_binary(&local);
+
+        // Accumulate two patches locally.
+        let mut patches = Vec::new();
+
+        let v1 = json!({"counter": 1});
+        if let Some(p) = diff_model(&local, &v1) {
+            apply_patch(&mut local, &p);
+            patches.push(p);
+        }
+
+        let v2 = json!({"counter": 2});
+        if let Some(p) = diff_model(&local, &v2) {
+            apply_patch(&mut local, &p);
+            patches.push(p);
+        }
+
+        // The remote model is a replica of the same initial binary (same CRDT history).
+        let mut remote =
+            model_from_binary(&initial_bytes).expect("remote decode should succeed");
+
+        merge_with_pending_patches(&mut remote, &patches);
+
+        assert_eq!(view_model(&remote)["counter"], json!(2));
+    }
+
+    #[test]
+    fn merge_with_empty_patches_is_noop() {
+        let data = json!({"v": 42});
+        let mut model = create_model(&data, MIN_SESSION_ID).expect("create_model should succeed");
+        let view_before = view_model(&model);
+        merge_with_pending_patches(&mut model, &[]);
+        assert_eq!(view_model(&model), view_before);
+    }
+}
