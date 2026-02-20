@@ -188,7 +188,6 @@ export interface PutOptions {
   sessionId?: number;
   skipUniqueCheck?: boolean;
   meta?: unknown;
-  durability?: "flush";
 }
 
 export interface GetOptions {
@@ -345,26 +344,3 @@ export interface SyncTransport {
   pull(collection: string, since: number): Promise<PullResult>;
 }
 
-// ============================================================================
-// Durable backend interface
-// ============================================================================
-
-/** Error emitted when IndexedDB persistence fails after retries. */
-export interface PersistenceError {
-  error: unknown;
-  failedOps: number;
-}
-
-/**
- * Extended backend interface for durability control.
- *
- * StorageBackend is the sync WASM-boundary contract. DurableBackend adds
- * async persistence lifecycle methods for backends that buffer writes
- * (like IndexedDbBackend).
- */
-export interface DurableBackend {
-  readonly hasPendingWrites: boolean;
-  flush(): Promise<void>;
-  close(): Promise<void>;
-  onPersistenceError(cb: (err: PersistenceError) => void): () => void;
-}

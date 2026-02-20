@@ -52,7 +52,7 @@ export function initOpfsWorker(collections: CollectionDefHandle[]): void {
       // Create WasmDb with the SQLite backend
       const wasm = new WasmDb(backend);
 
-      // Build collection definitions from blueprints (same as LessDb.initialize)
+      // Build collection definitions from blueprints
       const wasmDefs: unknown[] = [];
 
       for (const col of collections) {

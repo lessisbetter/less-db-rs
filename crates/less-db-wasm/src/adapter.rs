@@ -1,7 +1,10 @@
 //! WasmDb — the main WASM-exposed database class.
 //!
-//! Wraps `ReactiveAdapter<JsStorageBackend>` and exposes CRUD, query,
+//! Wraps `ReactiveAdapter<Adapter<JsStorageBackend>>` and exposes CRUD, query,
 //! observe, and sync-storage operations to JavaScript.
+//!
+//! All reads and writes go directly through the JS backend (no caching layer).
+//! For the OPFS path this means every operation hits SQLite synchronously in the worker.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,11 +16,7 @@ use less_db::{
     collection::builder::CollectionDef,
     query::types::{Query, SortDirection, SortEntry, SortInput},
     reactive::adapter::ReactiveAdapter,
-    storage::{
-        adapter::Adapter,
-        memory_mapped::MemoryMapped,
-        traits::{StorageLifecycle, StorageRead, StorageSync, StorageWrite},
-    },
+    storage::traits::{StorageLifecycle, StorageRead, StorageSync, StorageWrite},
     types::{
         DeleteOptions, GetOptions, ListOptions, PatchOptions, PutOptions, StoredRecordWithMeta,
     },
@@ -37,7 +36,7 @@ use crate::{
 /// Main database class exposed to JavaScript via WASM.
 #[wasm_bindgen]
 pub struct WasmDb {
-    adapter: ReactiveAdapter<MemoryMapped<JsStorageBackend>>,
+    adapter: ReactiveAdapter<JsStorageBackend>,
     collections: HashMap<String, Arc<CollectionDef>>,
 }
 
@@ -45,18 +44,12 @@ pub struct WasmDb {
 impl WasmDb {
     /// Create a new WasmDb with the given JS storage backend.
     ///
-    /// Wraps the JS backend in a `MemoryMapped` layer that loads all data
-    /// into Rust memory. Reads become zero-cost (no WASM boundary crossing).
-    /// Writes update memory and track pending ops for batch persistence.
+    /// All reads and writes go directly through the JS backend. For the OPFS
+    /// path this means every operation hits SQLite synchronously in the worker.
     #[wasm_bindgen(constructor)]
     pub fn new(backend: JsBackend) -> Result<WasmDb, JsValue> {
         let js_backend = JsStorageBackend::new(backend);
-        let mut memory_mapped = MemoryMapped::new(js_backend);
-        memory_mapped
-            .load_from_inner()
-            .map_err(|e| JsValue::from_str(&format!("Failed to load data into memory: {e}")))?;
-        let inner_adapter = Adapter::new(memory_mapped);
-        let adapter = ReactiveAdapter::new(inner_adapter);
+        let adapter = ReactiveAdapter::new(less_db::storage::adapter::Adapter::new(js_backend));
         Ok(WasmDb {
             adapter,
             collections: HashMap::new(),
@@ -368,25 +361,6 @@ impl WasmDb {
         self.adapter
             .set_last_sequence(collection, sequence as i64)
             .into_js()
-    }
-
-    // ========================================================================
-    // Persistence (MemoryMapped flush)
-    // ========================================================================
-
-    /// Flush pending in-memory changes to the inner JS backend.
-    /// This pushes accumulated writes across the WASM boundary in a single batch.
-    #[wasm_bindgen(js_name = "flushPersistence")]
-    pub fn flush_persistence(&self) -> Result<(), JsValue> {
-        self.adapter
-            .with_backend(|b| b.flush())
-            .map_err(|e| JsValue::from_str(&format!("Flush failed: {e}")))
-    }
-
-    /// Whether there are in-memory changes not yet flushed to the inner backend.
-    #[wasm_bindgen(js_name = "hasPendingPersistence")]
-    pub fn has_pending_persistence(&self) -> bool {
-        self.adapter.with_backend(|b| b.has_pending_changes())
     }
 }
 

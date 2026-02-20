@@ -30,23 +30,9 @@ export class OpfsWorkerHost {
     }
   }
 
-  /** Methods that modify data and require MemoryMapped→SQLite flush. */
-  private static MUTATING_METHODS = new Set([
-    "put", "patch", "delete", "bulkPut", "bulkDelete",
-    "markSynced", "applyRemoteChanges", "setLastSequence",
-  ]);
-
   private handleRequest(id: number, method: string, args: unknown[]): void {
     try {
       const result = this.dispatch(id, method, args);
-
-      // MemoryMapped holds writes in Rust memory. After each mutation,
-      // flush to the underlying SQLite backend so data persists on disk.
-      // This is inside the try block so flush errors are returned to the caller.
-      if (OpfsWorkerHost.MUTATING_METHODS.has(method)) {
-        this.wasm.flushPersistence();
-      }
-
       const response: WorkerResponse = { type: "response", id, result };
       self.postMessage(response);
     } catch (e) {
@@ -186,8 +172,6 @@ export class OpfsWorkerHost {
       unsub();
     }
     this.unsubscribers.clear();
-    // Flush any remaining in-memory changes to SQLite before closing
-    this.wasm.flushPersistence();
     // Close the underlying storage (SQLite DB)
     if (this.onClose) {
       this.onClose();

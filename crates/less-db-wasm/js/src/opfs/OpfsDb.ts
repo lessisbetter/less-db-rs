@@ -1,7 +1,7 @@
 /**
  * OpfsDb — main-thread async proxy for the OPFS SQLite worker.
  *
- * Mirrors the LessDb API surface, but all methods return Promises since
+ * Main-thread async proxy for the OPFS SQLite worker. All methods return Promises since
  * they cross a worker boundary via postMessage. Data serialization and
  * deserialization (Date/Uint8Array) happens on the main thread.
  */
@@ -28,12 +28,6 @@ import type {
 import { serializeForRust, deserializeFromRust } from "../conversions.js";
 import { WorkerRpc } from "./worker-rpc.js";
 
-/** Strip the `durability` key before passing options to the worker. */
-function stripDurability(options: PutOptions): Omit<PutOptions, "durability"> | null {
-  const { durability: _, ...rest } = options;
-  return Object.keys(rest).length > 0 ? rest : null;
-}
-
 export class OpfsDb {
   private rpc: WorkerRpc;
   private collections: Map<string, CollectionDefHandle>;
@@ -56,12 +50,11 @@ export class OpfsDb {
     data: CollectionWrite<S>,
     options?: PutOptions,
   ): Promise<CollectionRead<S>> {
-    const wasmOptions = options ? stripDurability(options) : null;
     const serialized = serializeForRust(data as Record<string, unknown>);
     const result = (await this.rpc.call("put", [
       def.name,
       serialized,
-      wasmOptions,
+      options ?? null,
     ])) as Record<string, unknown>;
     return deserializeFromRust(result, this.schemaFor(def)) as CollectionRead<S>;
   }
@@ -162,14 +155,13 @@ export class OpfsDb {
     records: CollectionWrite<S>[],
     options?: PutOptions,
   ): Promise<BatchResult<CollectionRead<S>>> {
-    const wasmOptions = options ? stripDurability(options) : null;
     const serialized = records.map((r) =>
       serializeForRust(r as Record<string, unknown>),
     );
     const result = (await this.rpc.call("bulkPut", [
       def.name,
       serialized,
-      wasmOptions,
+      options ?? null,
     ])) as { records: Record<string, unknown>[]; errors: BatchResult<unknown>["errors"] };
     return {
       records: result.records.map(
@@ -372,16 +364,8 @@ export class OpfsDb {
   }
 
   // ========================================================================
-  // Durability
+  // Lifecycle
   // ========================================================================
-
-  /** SQLite writes are immediately durable — always false. */
-  get hasPendingWrites(): boolean {
-    return false;
-  }
-
-  /** SQLite writes are immediately durable — no-op. */
-  async flush(): Promise<void> {}
 
   /** Close the worker and underlying database. */
   async close(): Promise<void> {

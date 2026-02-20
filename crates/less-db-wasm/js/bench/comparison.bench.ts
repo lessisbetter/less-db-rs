@@ -1,24 +1,11 @@
-// Comparison benchmark: less-db-wasm vs less-db-js vs Dexie.
+// Comparison benchmark: less-db-js vs Dexie.
 //
-// Note: WASM operations are synchronous (in-memory cache with async IDB flush),
-// while JS adapter and Dexie operations are async (awaiting IDB transactions).
-// This means WASM benchmarks measure CPU-bound work only, while JS/Dexie include
-// microtask/IDB overhead. This reflects real-world usage patterns — the WASM
-// library intentionally provides a synchronous API.
+// All operations are async (awaiting IDB transactions).
+// WASM/OPFS benchmarks are not included here since they require a worker setup.
 
 import { bench, describe } from "vitest";
 import Dexie, { type Table } from "dexie";
 import { generateUsers, type User } from "./shared.js";
-
-// ---------------------------------------------------------------------------
-// WASM imports (this package)
-// ---------------------------------------------------------------------------
-import {
-  collection as wasmCollection,
-  t as wasmT,
-  createDb,
-  type LessDb,
-} from "../src/index.js";
 
 // ---------------------------------------------------------------------------
 // JS reference imports (aliased via vitest.bench.config.ts)
@@ -30,18 +17,8 @@ import {
 } from "@less-platform/db";
 
 // ---------------------------------------------------------------------------
-// Collection definitions — identical schema, different builders
+// Collection definitions
 // ---------------------------------------------------------------------------
-const wasmUsers = wasmCollection("users")
-  .v(1, {
-    name: wasmT.string(),
-    email: wasmT.string(),
-    age: wasmT.number(),
-  })
-  .index(["name"])
-  .index(["age"])
-  .build();
-
 const jsUsers = jsCollection("users")
   .v(1, {
     name: jsT.string(),
@@ -57,38 +34,6 @@ const jsUsers = jsCollection("users")
 // ---------------------------------------------------------------------------
 interface DexieUser extends User {
   id?: number;
-}
-
-// ---------------------------------------------------------------------------
-// WASM lifecycle
-// ---------------------------------------------------------------------------
-let wasmDb: LessDb;
-let wasmDbName: string;
-let wasmCounter = 0;
-let wasmInsertedIds: string[] = [];
-
-async function setupWasm() {
-  wasmDbName = `wasm-bench-${Date.now()}-${wasmCounter++}`;
-  wasmDb = await createDb(wasmDbName, [wasmUsers]);
-  wasmInsertedIds = [];
-}
-
-async function teardownWasm() {
-  const req = indexedDB.deleteDatabase(wasmDbName);
-  await new Promise<void>((resolve, reject) => {
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
-  });
-}
-
-function wasmInsertUsers(count: number): string[] {
-  const data = generateUsers(count);
-  const ids: string[] = [];
-  for (const u of data) {
-    const result = wasmDb.put(wasmUsers, u);
-    ids.push(result.id);
-  }
-  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -153,14 +98,6 @@ async function teardownDexie() {
 describe("single operations", () => {
   // --- put (insert) ---
   bench(
-    "wasm: put",
-    () => {
-      wasmDb.put(wasmUsers, { name: "test", email: "test@example.com", age: 25 });
-    },
-    { iterations: 50, warmupIterations: 5, setup: setupWasm, teardown: teardownWasm },
-  );
-
-  bench(
     "js: put",
     async () => {
       await jsAdapter.put(jsUsers, { name: "test", email: "test@example.com", age: 25 });
@@ -177,22 +114,6 @@ describe("single operations", () => {
   );
 
   // --- get ---
-  bench(
-    "wasm: get",
-    () => {
-      wasmDb.get(wasmUsers, wasmInsertedIds[0]!);
-    },
-    {
-      iterations: 50,
-      warmupIterations: 5,
-      setup: async () => {
-        await setupWasm();
-        wasmInsertedIds = wasmInsertUsers(1);
-      },
-      teardown: teardownWasm,
-    },
-  );
-
   bench(
     "js: get",
     async () => {
@@ -226,23 +147,6 @@ describe("single operations", () => {
   );
 
   // --- put (update) ---
-  bench(
-    "wasm: put (update)",
-    () => {
-      const existing = wasmDb.get(wasmUsers, wasmInsertedIds[0]!);
-      wasmDb.put(wasmUsers, { ...existing!, age: 30 });
-    },
-    {
-      iterations: 50,
-      warmupIterations: 5,
-      setup: async () => {
-        await setupWasm();
-        wasmInsertedIds = wasmInsertUsers(1);
-      },
-      teardown: teardownWasm,
-    },
-  );
-
   bench(
     "js: put (update)",
     async () => {
@@ -278,22 +182,6 @@ describe("single operations", () => {
 
   // --- patch ---
   bench(
-    "wasm: patch",
-    () => {
-      wasmDb.patch(wasmUsers, { id: wasmInsertedIds[0]!, age: 99 });
-    },
-    {
-      iterations: 50,
-      warmupIterations: 5,
-      setup: async () => {
-        await setupWasm();
-        wasmInsertedIds = wasmInsertUsers(1);
-      },
-      teardown: teardownWasm,
-    },
-  );
-
-  bench(
     "js: patch",
     async () => {
       await jsAdapter.patch(jsUsers, { id: jsInsertedIds[0]!, age: 99 });
@@ -326,22 +214,6 @@ describe("single operations", () => {
   );
 
   // --- delete ---
-  bench(
-    "wasm: delete",
-    () => {
-      wasmDb.delete(wasmUsers, wasmInsertedIds[0]!);
-    },
-    {
-      iterations: 50,
-      warmupIterations: 5,
-      setup: async () => {
-        await setupWasm();
-        wasmInsertedIds = wasmInsertUsers(1);
-      },
-      teardown: teardownWasm,
-    },
-  );
-
   bench(
     "js: delete",
     async () => {
@@ -381,14 +253,6 @@ describe("single operations", () => {
 describe("bulk operations", () => {
   // --- bulkPut 100 ---
   bench(
-    "wasm: bulkPut 100",
-    () => {
-      wasmDb.bulkPut(wasmUsers, generateUsers(100));
-    },
-    { iterations: 20, warmupIterations: 2, setup: setupWasm, teardown: teardownWasm },
-  );
-
-  bench(
     "js: bulkPut 100",
     async () => {
       await jsAdapter.bulkPut(jsUsers, generateUsers(100));
@@ -406,14 +270,6 @@ describe("bulk operations", () => {
 
   // --- bulkPut 1000 ---
   bench(
-    "wasm: bulkPut 1000",
-    () => {
-      wasmDb.bulkPut(wasmUsers, generateUsers(1000));
-    },
-    { iterations: 10, warmupIterations: 1, setup: setupWasm, teardown: teardownWasm },
-  );
-
-  bench(
     "js: bulkPut 1000",
     async () => {
       await jsAdapter.bulkPut(jsUsers, generateUsers(1000));
@@ -430,22 +286,6 @@ describe("bulk operations", () => {
   );
 
   // --- getAll 100 ---
-  bench(
-    "wasm: getAll 100",
-    () => {
-      wasmDb.getAll(wasmUsers);
-    },
-    {
-      iterations: 20,
-      warmupIterations: 2,
-      setup: async () => {
-        await setupWasm();
-        wasmInsertedIds = wasmInsertUsers(100);
-      },
-      teardown: teardownWasm,
-    },
-  );
-
   bench(
     "js: getAll 100",
     async () => {
@@ -480,22 +320,6 @@ describe("bulk operations", () => {
 
   // --- getAll 1000 ---
   bench(
-    "wasm: getAll 1000",
-    () => {
-      wasmDb.getAll(wasmUsers);
-    },
-    {
-      iterations: 10,
-      warmupIterations: 1,
-      setup: async () => {
-        await setupWasm();
-        wasmInsertedIds = wasmInsertUsers(1000);
-      },
-      teardown: teardownWasm,
-    },
-  );
-
-  bench(
     "js: getAll 1000",
     async () => {
       await jsAdapter.getAll(jsUsers);
@@ -528,22 +352,6 @@ describe("bulk operations", () => {
   );
 
   // --- bulkDelete 100 ---
-  bench(
-    "wasm: bulkDelete 100",
-    () => {
-      wasmDb.bulkDelete(wasmUsers, wasmInsertedIds);
-    },
-    {
-      iterations: 20,
-      warmupIterations: 2,
-      setup: async () => {
-        await setupWasm();
-        wasmInsertedIds = wasmInsertUsers(100);
-      },
-      teardown: teardownWasm,
-    },
-  );
-
   bench(
     "js: bulkDelete 100",
     async () => {
@@ -584,11 +392,6 @@ describe("bulk operations", () => {
 // Queries (1000 records)
 // ===========================================================================
 describe("queries (1000 records)", () => {
-  const setupWasmWith1000 = async () => {
-    await setupWasm();
-    wasmInsertUsers(1000);
-  };
-
   const setupJsWith1000 = async () => {
     await setupJs();
     await jsInsertUsers(1000);
@@ -600,14 +403,6 @@ describe("queries (1000 records)", () => {
   };
 
   // --- equals (indexed) ---
-  bench(
-    "wasm: query equals (indexed)",
-    () => {
-      wasmDb.query(wasmUsers, { filter: { age: 25 } });
-    },
-    { iterations: 30, warmupIterations: 3, setup: setupWasmWith1000, teardown: teardownWasm },
-  );
-
   bench(
     "js: query equals (indexed)",
     async () => {
@@ -626,14 +421,6 @@ describe("queries (1000 records)", () => {
 
   // --- range (indexed) ---
   bench(
-    "wasm: query range (indexed)",
-    () => {
-      wasmDb.query(wasmUsers, { filter: { age: { $gte: 20, $lt: 30 } } });
-    },
-    { iterations: 30, warmupIterations: 3, setup: setupWasmWith1000, teardown: teardownWasm },
-  );
-
-  bench(
     "js: query range (indexed)",
     async () => {
       await jsAdapter.query(jsUsers, { filter: { age: { $gte: 20, $lt: 30 } } });
@@ -650,14 +437,6 @@ describe("queries (1000 records)", () => {
   );
 
   // --- sort (indexed) ---
-  bench(
-    "wasm: query sort (indexed)",
-    () => {
-      wasmDb.query(wasmUsers, { sort: "age" });
-    },
-    { iterations: 30, warmupIterations: 3, setup: setupWasmWith1000, teardown: teardownWasm },
-  );
-
   bench(
     "js: query sort (indexed)",
     async () => {
@@ -676,14 +455,6 @@ describe("queries (1000 records)", () => {
 
   // --- limit 10 ---
   bench(
-    "wasm: query limit 10",
-    () => {
-      wasmDb.query(wasmUsers, { limit: 10 });
-    },
-    { iterations: 30, warmupIterations: 3, setup: setupWasmWith1000, teardown: teardownWasm },
-  );
-
-  bench(
     "js: query limit 10",
     async () => {
       await jsAdapter.query(jsUsers, { limit: 10 });
@@ -700,14 +471,6 @@ describe("queries (1000 records)", () => {
   );
 
   // --- count ---
-  bench(
-    "wasm: count",
-    () => {
-      wasmDb.count(wasmUsers);
-    },
-    { iterations: 30, warmupIterations: 3, setup: setupWasmWith1000, teardown: teardownWasm },
-  );
-
   bench(
     "js: count",
     async () => {

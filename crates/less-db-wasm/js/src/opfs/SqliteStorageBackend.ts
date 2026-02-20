@@ -139,7 +139,7 @@ function serializeRecord(record: SerializedRecord): {
 }
 
 // ============================================================================
-// IndexedDbBackend-compatible unique constraint checking types
+// Unique constraint checking types
 // (Shape of index objects passed from Rust via WASM)
 // ============================================================================
 
@@ -221,7 +221,7 @@ export class SqliteStorageBackend implements StorageBackend {
     try {
       stmt.bind([collection, id]);
       if (stmt.step()) {
-        return rowToRecord(stmt.get({ rowMode: "array" }) as unknown[]);
+        return rowToRecord(stmt.get([]) as unknown[]);
       }
       return null;
     } finally {
