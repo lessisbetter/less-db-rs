@@ -16,12 +16,17 @@ export default defineConfig({
       "@less-platform/db": path.resolve(LESS_DB_JS_PATH),
     },
   },
+  worker: {
+    format: "es",
+    plugins: () => [wasm(), topLevelAwait()],
+  },
   test: {
     include: ["bench/**/*.bench.ts"],
     benchmark: {
       include: ["bench/**/*.bench.ts"],
       outputJson: "bench/results.json",
     },
+    testTimeout: 30_000,
     browser: {
       enabled: true,
       provider: playwright(),

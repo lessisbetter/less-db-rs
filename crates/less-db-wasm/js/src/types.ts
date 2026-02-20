@@ -94,69 +94,6 @@ export type CollectionPatch<S extends SchemaShape> = {
 } & Partial<{ [K in keyof S]: InferWrite<S[K]> }>;
 
 // ============================================================================
-// Storage backend interface
-// ============================================================================
-
-export interface SerializedRecord {
-  id: string;
-  collection: string;
-  version: number;
-  data: unknown;
-  crdt: number[];
-  pending_patches: number[];
-  sequence: number;
-  dirty: boolean;
-  deleted: boolean;
-  deleted_at: string | null;
-  meta: unknown;
-  computed: unknown;
-}
-
-export interface RawBatchResult {
-  records: SerializedRecord[];
-}
-
-export interface ScanOptions {
-  include_deleted?: boolean;
-  limit?: number;
-  offset?: number;
-}
-
-export interface PurgeTombstonesOptions {
-  older_than_seconds?: number;
-  dry_run?: boolean;
-}
-
-/** JS storage backend interface — implement this to provide storage. */
-export interface StorageBackend {
-  getRaw(collection: string, id: string): SerializedRecord | null;
-  putRaw(record: SerializedRecord): void;
-  scanRaw(collection: string, options: ScanOptions): RawBatchResult;
-  scanDirtyRaw(collection: string): RawBatchResult;
-  countRaw(collection: string): number;
-  batchPutRaw(records: SerializedRecord[]): void;
-  purgeTombstonesRaw(collection: string, options: PurgeTombstonesOptions): number;
-  getMeta(key: string): string | null;
-  setMeta(key: string, value: string): void;
-  scanIndexRaw(collection: string, scan: unknown): RawBatchResult | null;
-  countIndexRaw(collection: string, scan: unknown): number | null;
-  checkUnique(
-    collection: string,
-    index: unknown,
-    data: unknown,
-    computed: unknown,
-    excludeId: string | null,
-  ): void;
-  beginTransaction(): void;
-  commit(): void;
-  rollback(): void;
-  /** Load all records from storage (used for memory-mapped init). */
-  scanAllRaw(): RawBatchResult;
-  /** Load all metadata key-value pairs (used for memory-mapped init). */
-  scanAllMeta(): Array<{ key: string; value: string }>;
-}
-
-// ============================================================================
 // Query types
 // ============================================================================
 

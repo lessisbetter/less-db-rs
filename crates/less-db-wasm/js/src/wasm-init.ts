@@ -8,13 +8,17 @@
 
 /** The shape we need from the WASM module. */
 export interface WasmModule {
-  WasmDb: new (backend: unknown) => WasmDbInstance;
+  WasmDb: {
+    create(dbName: string): Promise<WasmDbInstance>;
+  };
   WasmCollectionBuilder: new (name: string) => WasmCollectionBuilderInstance;
 }
 
 /** @internal */
 export interface WasmDbInstance {
   initialize(defs: unknown[]): void;
+  close(): void;
+  deleteDatabase(): Promise<void>;
   put(collection: string, data: unknown, options: unknown): unknown;
   get(collection: string, id: string, options: unknown): unknown;
   patch(collection: string, data: unknown, options: unknown): unknown;

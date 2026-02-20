@@ -9,17 +9,18 @@ check: fmt lint test test-js test-browser
 fmt:
     cargo fmt --all
 
-# Run clippy linter
+# Run clippy linter (less-db-wasm requires wasm32 target due to sqlite-wasm-rs)
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p less-db --all-targets -- -D warnings
+    cargo clippy -p less-db-wasm --target wasm32-unknown-unknown -- -D warnings
 
-# Run Rust tests
+# Run Rust tests (less-db only; less-db-wasm tests run via test-browser)
 test *args:
-    cargo test --workspace {{args}}
+    cargo test -p less-db {{args}}
 
 # Run Rust tests with verbose output
 test-v *args:
-    cargo test --workspace {{args}} -- --nocapture
+    cargo test -p less-db {{args}} -- --nocapture
 
 # Run TypeScript type check
 typecheck-js:
@@ -43,11 +44,13 @@ bench-browser:
 
 # Build all targets
 build:
-    cargo build --workspace
+    cargo build -p less-db
+    cargo build -p less-db-wasm --target wasm32-unknown-unknown
 
 # Build release
 build-release:
-    cargo build --workspace --release
+    cargo build -p less-db --release
+    cargo build -p less-db-wasm --target wasm32-unknown-unknown --release
 
 # Clean build artifacts
 clean:

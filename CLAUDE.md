@@ -15,15 +15,15 @@ schema migrations, and reactive queries.
 ## Commands
 
 ```bash
-just check         # Run everything: format, lint, Rust tests, TS typecheck, vitest
-just test           # Rust tests only
+just check         # Run everything: format, lint, Rust tests, TS typecheck, vitest, browser tests
+just test           # Rust tests (less-db only; less-db-wasm runs via test-browser)
 just test-js        # TypeScript typecheck + vitest
-just lint           # cargo clippy
+just test-browser   # Browser integration tests (real WASM + OPFS)
+just lint           # cargo clippy (less-db native + less-db-wasm wasm32)
 just fmt            # cargo fmt
 
 # Single Rust test
 cargo test -p less-db test_name
-cargo test -p less-db-wasm test_name
 
 # Single JS test file
 cd crates/less-db-wasm/js && npx vitest run src/collection.test.ts
@@ -65,26 +65,30 @@ The core follows a layered architecture mirroring the JS `AdapterBase` pattern:
 
 ### WASM crate (`less-db-wasm`)
 
-Rust side (`src/`): `wasm-bindgen` glue exposing `WasmDb` and `WasmCollectionBuilder` to JS.
+Rust side (`src/`):
+- **`adapter.rs`** — `WasmDb`: main WASM-exposed database class. `WasmDb::create(db_name)` async factory installs OPFS VFS, opens SQLite, initializes schema.
+- **`wasm_sqlite.rs`** — Safe wrapper over `sqlite-wasm-rs` FFI (`Connection`, `Statement`).
+- **`wasm_sqlite_backend.rs`** — `WasmSqliteBackend` implementing `StorageBackend` using `wasm_sqlite`.
+- **`middleware.rs`** — `WasmTypedDb`: middleware-aware wrapper around `TypedAdapter`.
+- **`collection.rs`** — `WasmCollectionBuilder` for building collection definitions from JS.
 
 TypeScript side (`js/src/`):
-- **`collection.ts`** — Standalone `collection()` builder. Pure data, no WASM dependency. `.build()` returns a `CollectionDefHandle` with a symbol-keyed `[BLUEPRINT]`.
+- **`collection.ts`** — Standalone `collection()` builder. Pure data, no WASM dependency.
 - **`wasm-init.ts`** — WASM singleton: `initWasm()` (async), `ensureWasm()` (sync), `setWasmForTesting()`.
-- **`LessDb.ts`** — Main DB class. Constructor takes `StorageBackend`, uses `ensureWasm()`. `initialize()` materializes blueprints into WASM builder calls.
-- **`index.ts`** — Public API. `createDb(name, collections)` opens IndexedDB + loads WASM in parallel.
-- **`types.ts`** — All TypeScript types including `BLUEPRINT` symbol, `CollectionDefHandle`, `StorageBackend`.
-- **`IndexedDbBackend.ts`** — IndexedDB `StorageBackend` implementation with in-memory cache.
+- **`opfs/`** — OPFS worker: `init.ts` (worker entry), `OpfsDb.ts` (main-thread proxy), `OpfsWorkerHost.ts` (worker message handler).
+- **`createOpfsDb.ts`** — `createOpfsDb(name, collections, opts)` factory function.
 - **`conversions.ts`** — Date/Uint8Array ↔ ISO string/base64 serialization for WASM boundary.
 - **`schema.ts`** — `t` schema builder (mirrors Rust `SchemaNode`).
+
+**Architecture:** SQLite runs entirely inside the Rust WASM module via `sqlite-wasm-rs` with OPFS persistence. Zero Rust↔JS boundary crossings for storage operations. The only JS↔WASM boundary is the user-facing API (put/get/query calls from main thread → worker → WASM).
 
 ### Key decisions
 
 - **`serde_json::Value`** everywhere JS uses `unknown`. No native `Date` or `Uint8Array` — dates are ISO 8601 strings, bytes are base64 strings.
 - **`Arc<CollectionDef>`** for shared ownership — contains `Box<dyn Fn>` migration closures so it can't be `Clone`.
-- **Sync storage, async transport.** SQLite via `rusqlite` is synchronous. `SyncTransport` is async.
-- **`parking_lot::Mutex<rusqlite::Connection>`** for thread safety.
+- **SQLite in WASM.** `sqlite-wasm-rs` + `sqlite-wasm-vfs` (OPFS SAH Pool). `PRAGMA journal_mode=DELETE` (OPFS VFS doesn't support WAL shared memory). Synchronous operations, async VFS init.
+- **`unsafe impl Send/Sync`** for `WasmSqliteBackend` — WASM is single-threaded. Gated with `#[cfg(target_arch = "wasm32")]`.
 - **Layered errors.** Module-level types (`SchemaError`, `StorageError`, etc.) roll up into `LessDbError` via `#[from]`. Public API returns `LessDbError`; internals use narrow types.
-- **No `unsafe`.** Pure safe Rust throughout.
 
 ## Working practices
 

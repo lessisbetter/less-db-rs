@@ -11,11 +11,9 @@ import type { WasmDbInstance } from "../wasm-init.js";
 export class OpfsWorkerHost {
   private wasm: WasmDbInstance;
   private unsubscribers = new Map<number, () => void>();
-  private onClose?: () => void;
 
-  constructor(wasm: WasmDbInstance, onClose?: () => void) {
+  constructor(wasm: WasmDbInstance) {
     this.wasm = wasm;
-    this.onClose = onClose;
     self.onmessage = (ev: MessageEvent<MainToWorkerMessage>) => this.handleMessage(ev.data);
   }
 
@@ -172,10 +170,8 @@ export class OpfsWorkerHost {
       unsub();
     }
     this.unsubscribers.clear();
-    // Close the underlying storage (SQLite DB)
-    if (this.onClose) {
-      this.onClose();
-    }
+    // Close the SQLite connection (now handled in Rust)
+    this.wasm.close();
     return undefined;
   }
 }

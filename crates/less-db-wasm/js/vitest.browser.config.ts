@@ -5,11 +5,6 @@ import topLevelAwait from "vite-plugin-top-level-await";
 
 export default defineConfig({
   plugins: [wasm(), topLevelAwait()],
-  optimizeDeps: {
-    // @sqlite.org/sqlite-wasm is an Emscripten module that breaks when
-    // pre-bundled by Vite. Exclude it so it's loaded as-is.
-    exclude: ["@sqlite.org/sqlite-wasm"],
-  },
   worker: {
     format: "es",
     plugins: () => [wasm(), topLevelAwait()],

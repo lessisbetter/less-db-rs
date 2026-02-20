@@ -1,10 +1,10 @@
 //! WasmDb — the main WASM-exposed database class.
 //!
-//! Wraps `ReactiveAdapter<Adapter<JsStorageBackend>>` and exposes CRUD, query,
+//! Wraps `ReactiveAdapter<Adapter<WasmSqliteBackend>>` and exposes CRUD, query,
 //! observe, and sync-storage operations to JavaScript.
 //!
-//! All reads and writes go directly through the JS backend (no caching layer).
-//! For the OPFS path this means every operation hits SQLite synchronously in the worker.
+//! SQLite runs entirely inside the Rust WASM module via sqlite-wasm-rs.
+//! Zero Rust↔JS boundary crossings for storage operations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,7 +26,8 @@ use crate::{
     collection::WasmCollectionDef,
     conversions::{js_to_value, value_to_js},
     error::IntoJsResult,
-    js_backend::{JsBackend, JsStorageBackend},
+    wasm_sqlite::Connection,
+    wasm_sqlite_backend::WasmSqliteBackend,
 };
 
 // ============================================================================
@@ -36,33 +37,110 @@ use crate::{
 /// Main database class exposed to JavaScript via WASM.
 #[wasm_bindgen]
 pub struct WasmDb {
-    adapter: ReactiveAdapter<JsStorageBackend>,
+    adapter: ReactiveAdapter<WasmSqliteBackend>,
     collections: HashMap<String, Arc<CollectionDef>>,
+    db_name: String,
 }
 
 #[wasm_bindgen]
 impl WasmDb {
-    /// Create a new WasmDb with the given JS storage backend.
+    /// Create a new WasmDb with SQLite running entirely in Rust WASM.
     ///
-    /// All reads and writes go directly through the JS backend. For the OPFS
-    /// path this means every operation hits SQLite synchronously in the worker.
-    #[wasm_bindgen(constructor)]
-    pub fn new(backend: JsBackend) -> Result<WasmDb, JsValue> {
-        let js_backend = JsStorageBackend::new(backend);
-        let adapter = ReactiveAdapter::new(less_db::storage::adapter::Adapter::new(js_backend));
+    /// 1. Installs the OPFS SAH Pool VFS (async — allocates OPFS file handles).
+    /// 2. Opens a SQLite connection (sync).
+    /// 3. Initializes the database schema.
+    ///
+    /// After this, all storage operations are synchronous with zero JS↔WASM
+    /// boundary crossings.
+    pub async fn create(db_name: &str) -> Result<WasmDb, JsValue> {
+        use sqlite_wasm_vfs::sahpool::{install, OpfsSAHPoolCfg};
+
+        // Install the OPFS SAH Pool VFS (async — needs OPFS access handles)
+        let cfg = OpfsSAHPoolCfg {
+            directory: format!(".less-db-{db_name}"),
+            initial_capacity: 6,
+            clear_on_init: false,
+            ..Default::default()
+        };
+
+        install::<sqlite_wasm_rs::WasmOsCallback>(&cfg, true)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to install OPFS VFS: {e:?}")))?;
+
+        // Open SQLite connection (sync after VFS is installed)
+        let db_path = format!("/{db_name}.sqlite3");
+        let conn = Connection::open(&db_path)
+            .map_err(|e| JsValue::from_str(&format!("Failed to open SQLite: {e}")))?;
+
+        // Create backend and initialize schema
+        let backend = WasmSqliteBackend::new(conn);
+        backend
+            .init_schema()
+            .map_err(|e| JsValue::from_str(&format!("Failed to init schema: {e}")))?;
+
+        let adapter = ReactiveAdapter::new(less_db::storage::adapter::Adapter::new(backend));
+
         Ok(WasmDb {
             adapter,
             collections: HashMap::new(),
+            db_name: db_name.to_string(),
         })
     }
 
     /// Initialize the database with collection definitions.
     pub fn initialize(&mut self, defs: Vec<WasmCollectionDef>) -> Result<(), JsValue> {
+        // Create collection-specific indexes before initializing the adapter
+        self.adapter.with_backend(|backend| {
+            for def in &defs {
+                if let Err(e) = backend.create_collection_indexes(&def.inner) {
+                    // Log but don't fail — indexes are optimization, not correctness
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "Failed to create indexes for {}: {e}",
+                        def.inner.name
+                    )));
+                }
+            }
+        });
+
         let arcs: Vec<Arc<CollectionDef>> = defs.iter().map(|d| d.inner.clone()).collect();
         for arc in &arcs {
             self.collections.insert(arc.name.clone(), arc.clone());
         }
         self.adapter.initialize(&arcs).into_js()
+    }
+
+    /// Close the database, releasing the SQLite connection and OPFS handles.
+    pub fn close(&mut self) -> Result<(), JsValue> {
+        // Close the SQLite connection in the backend
+        self.adapter
+            .with_backend(|backend| backend.close())
+            .into_js()?;
+        // Mark the adapter as uninitialized
+        self.adapter.close().into_js()
+    }
+
+    /// Delete the OPFS database files. Must call close() first.
+    #[wasm_bindgen(js_name = "deleteDatabase")]
+    pub async fn delete_database(&self) -> Result<(), JsValue> {
+        use sqlite_wasm_vfs::sahpool::{install, OpfsSAHPoolCfg};
+
+        let cfg = OpfsSAHPoolCfg {
+            directory: format!(".less-db-{}", self.db_name),
+            initial_capacity: 6,
+            clear_on_init: false,
+            ..Default::default()
+        };
+
+        let pool_util = install::<sqlite_wasm_rs::WasmOsCallback>(&cfg, false)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to get OPFS pool util: {e:?}")))?;
+
+        let db_path = format!("/{}.sqlite3", self.db_name);
+        pool_util
+            .delete_db(&db_path)
+            .map_err(|e| JsValue::from_str(&format!("Failed to delete database: {e:?}")))?;
+
+        Ok(())
     }
 
     // ========================================================================

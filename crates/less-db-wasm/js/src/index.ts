@@ -44,12 +44,6 @@ export type {
   CollectionPatch,
   // Collection
   CollectionDefHandle,
-  // Storage backend
-  StorageBackend,
-  SerializedRecord,
-  RawBatchResult,
-  ScanOptions,
-  PurgeTombstonesOptions,
   // Query
   QueryOptions,
   QueryResult,

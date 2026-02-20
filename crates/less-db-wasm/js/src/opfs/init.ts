@@ -12,14 +12,13 @@
  * ```
  *
  * The worker waits for an "open" request from the main thread with the
- * database name, then initializes WASM + SQLite + OPFS, and starts
- * handling requests.
+ * database name, then initializes WASM + SQLite (inside the Rust WASM module),
+ * and starts handling requests.
  */
 
 import type { CollectionDefHandle, CollectionBlueprint } from "../types.js";
 import { BLUEPRINT } from "../types.js";
 import type { MainToWorkerMessage, WorkerReady, WorkerResponse } from "./types.js";
-import { SqliteStorageBackend } from "./SqliteStorageBackend.js";
 import { OpfsWorkerHost } from "./OpfsWorkerHost.js";
 
 export function initOpfsWorker(collections: CollectionDefHandle[]): void {
@@ -42,15 +41,12 @@ export function initOpfsWorker(collections: CollectionDefHandle[]): void {
     const dbName = msg.args[0] as string;
 
     try {
-      // Load WASM
+      // Load WASM module
       const wasmModule = await import("../../../pkg/less_db_wasm.js");
       const { WasmDb, WasmCollectionBuilder } = wasmModule;
 
-      // Create SQLite backend with OPFS persistence
-      const backend = await SqliteStorageBackend.create(dbName);
-
-      // Create WasmDb with the SQLite backend
-      const wasm = new WasmDb(backend);
+      // Create WasmDb — this installs OPFS VFS and opens SQLite entirely in Rust
+      const wasm = await WasmDb.create(dbName);
 
       // Build collection definitions from blueprints
       const wasmDefs: unknown[] = [];
@@ -82,10 +78,7 @@ export function initOpfsWorker(collections: CollectionDefHandle[]): void {
       wasm.initialize(wasmDefs as any);
 
       // Switch to the OpfsWorkerHost for all subsequent messages.
-      // Pass a close callback to properly shut down SQLite.
-      new OpfsWorkerHost(wasm, () => {
-        backend.close();
-      });
+      new OpfsWorkerHost(wasm);
 
       // Respond to the open request
       const response: WorkerResponse = { type: "response", id: requestId, result: true };

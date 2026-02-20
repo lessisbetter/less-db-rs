@@ -29,7 +29,8 @@ use crate::{
     collection::WasmCollectionDef,
     conversions::{js_to_value, value_to_js},
     error::IntoJsResult,
-    js_backend::{JsBackend, JsStorageBackend},
+    wasm_sqlite::Connection,
+    wasm_sqlite_backend::WasmSqliteBackend,
 };
 
 // ============================================================================
@@ -204,7 +205,7 @@ unsafe impl Sync for SendSyncCallback {}
 
 /// Middleware-aware database class exposed to JavaScript via WASM.
 ///
-/// Wraps `TypedAdapter<JsStorageBackend>` — all read operations are enriched
+/// Wraps `TypedAdapter<WasmSqliteBackend>` — all read operations are enriched
 /// via `onRead`, write operations extract metadata via `onWrite`, and queries
 /// can be filtered via `onQuery`.
 ///
@@ -213,28 +214,49 @@ unsafe impl Sync for SendSyncCallback {}
 #[wasm_bindgen]
 pub struct WasmTypedDb {
     /// Created after `initialize()` is called.
-    adapter: Option<TypedAdapter<JsStorageBackend>>,
+    adapter: Option<TypedAdapter<WasmSqliteBackend>>,
     /// Held until `initialize()` transfers ownership to `TypedAdapter`.
-    reactive: Option<ReactiveAdapter<JsStorageBackend>>,
+    reactive: Option<ReactiveAdapter<WasmSqliteBackend>>,
     middleware: Arc<dyn Middleware>,
     collections: HashMap<String, Arc<CollectionDef>>,
 }
 
 #[wasm_bindgen]
 impl WasmTypedDb {
-    /// Create a new WasmTypedDb with a JS storage backend and middleware.
-    #[wasm_bindgen(constructor)]
-    pub fn new(backend: JsBackend, middleware: JsMiddleware) -> Self {
-        let js_backend = JsStorageBackend::new(backend);
-        let inner_adapter = Adapter::new(js_backend);
+    /// Create a new WasmTypedDb with SQLite running in Rust WASM and a JS middleware.
+    pub async fn create(db_name: &str, middleware: JsMiddleware) -> Result<WasmTypedDb, JsValue> {
+        use sqlite_wasm_vfs::sahpool::{install, OpfsSAHPoolCfg};
+
+        let cfg = OpfsSAHPoolCfg {
+            directory: format!(".less-db-{db_name}"),
+            initial_capacity: 6,
+            clear_on_init: false,
+            ..Default::default()
+        };
+
+        install::<sqlite_wasm_rs::WasmOsCallback>(&cfg, true)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("Failed to install OPFS VFS: {e:?}")))?;
+
+        let db_path = format!("/{db_name}.sqlite3");
+        let conn = Connection::open(&db_path)
+            .map_err(|e| JsValue::from_str(&format!("Failed to open SQLite: {e}")))?;
+
+        let backend = WasmSqliteBackend::new(conn);
+        backend
+            .init_schema()
+            .map_err(|e| JsValue::from_str(&format!("Failed to init schema: {e}")))?;
+
+        let inner_adapter = Adapter::new(backend);
         let reactive = ReactiveAdapter::new(inner_adapter);
         let mw: Arc<dyn Middleware> = Arc::new(JsMiddlewareWrapper::new(middleware));
-        Self {
+
+        Ok(WasmTypedDb {
             adapter: None,
             reactive: Some(reactive),
             middleware: mw,
             collections: HashMap::new(),
-        }
+        })
     }
 
     /// Initialize the database with collection definitions.
@@ -247,6 +269,19 @@ impl WasmTypedDb {
             .reactive
             .take()
             .ok_or_else(|| JsValue::from_str("initialize() has already been called"))?;
+
+        // Create collection-specific SQL indexes before initializing the adapter
+        reactive.with_backend(|backend| {
+            for def in &defs {
+                if let Err(e) = backend.create_collection_indexes(&def.inner) {
+                    web_sys::console::warn_1(&JsValue::from_str(&format!(
+                        "Failed to create indexes for {}: {e}",
+                        def.inner.name
+                    )));
+                }
+            }
+        });
+
         reactive.initialize(&arcs).into_js()?;
         let typed = TypedAdapter::new(reactive, Arc::clone(&self.middleware));
         self.adapter = Some(typed);
@@ -613,7 +648,7 @@ impl WasmTypedDb {
         })
     }
 
-    fn typed(&self) -> Result<&TypedAdapter<JsStorageBackend>, JsValue> {
+    fn typed(&self) -> Result<&TypedAdapter<WasmSqliteBackend>, JsValue> {
         self.adapter
             .as_ref()
             .ok_or_else(|| JsValue::from_str("Database not initialized. Call initialize() first."))

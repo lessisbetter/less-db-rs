@@ -18,6 +18,9 @@ js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
 getrandom = { version = "0.2", features = ["js"] }
 async-trait = "0.1"
+sqlite-wasm-rs = "0.5"
+sqlite-wasm-vfs = "0.2"
+web-sys = { version = "0.3", features = ["console"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
