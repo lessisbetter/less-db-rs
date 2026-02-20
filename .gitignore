@@ -4,3 +4,4 @@
 node_modules/
 crates/less-db-wasm/pkg/
 crates/less-db-wasm/js/dist/
+__screenshots__/

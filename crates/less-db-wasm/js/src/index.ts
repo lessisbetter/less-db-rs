@@ -101,6 +101,11 @@ export { initWasm, setWasmForTesting } from "./wasm-init.js";
 // Re-export builder option types
 export type { IndexOptions, ComputedOptions } from "./collection.js";
 
+// Re-export OPFS backend
+export { OpfsDb } from "./opfs/OpfsDb.js";
+export { createOpfsDb } from "./createOpfsDb.js";
+export type { CreateOpfsDbOptions } from "./createOpfsDb.js";
+
 /**
  * Create a database instance with IndexedDB storage and WASM engine.
  *

@@ -10,6 +10,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./worker": {
+      "import": "./src/opfs/init.ts",
+      "types": "./src/opfs/init.ts"
     }
   },
   "license": "MIT",
@@ -30,6 +34,9 @@
     "test:watch": "vitest",
     "test:browser": "vitest run --config vitest.browser.config.ts",
     "bench": "vitest bench --config vitest.bench.config.ts"
+  },
+  "dependencies": {
+    "@sqlite.org/sqlite-wasm": "^3.51.2-build6"
   },
   "devDependencies": {
     "@vitest/browser": "^4.0.18",
