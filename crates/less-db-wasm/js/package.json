@@ -13,14 +13,25 @@
     }
   },
   "license": "MIT",
-  "keywords": ["database", "crdt", "wasm", "local-first", "reactive", "sync"],
+  "keywords": [
+    "database",
+    "crdt",
+    "wasm",
+    "local-first",
+    "reactive",
+    "sync"
+  ],
   "scripts": {
     "build:wasm": "wasm-pack build --target bundler ..",
     "build:ts": "tsc --project tsconfig.json",
     "build": "npm run build:wasm && npm run build:ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
-    "typescript": "^5.0.0"
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "^5.0.0",
+    "vitest": "^4.0.18"
   }
 }

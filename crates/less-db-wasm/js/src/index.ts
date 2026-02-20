@@ -84,6 +84,9 @@ export type {
 // Re-export conversions for advanced use
 export { serializeForRust, deserializeFromRust } from "./conversions.js";
 
+// Re-export IndexedDB backend
+export { IndexedDbBackend } from "./IndexedDbBackend.js";
+
 // Re-export LessDb class
 import { LessDb } from "./LessDb.js";
 export { LessDb };
