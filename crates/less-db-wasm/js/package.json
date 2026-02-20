@@ -1,0 +1,26 @@
+{
+  "name": "less-db-wasm",
+  "version": "0.1.0",
+  "description": "WASM-powered local-first document store with CRDT sync, schema migrations, and reactive queries",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "license": "MIT",
+  "keywords": ["database", "crdt", "wasm", "local-first", "reactive", "sync"],
+  "scripts": {
+    "build:wasm": "wasm-pack build --target bundler ..",
+    "build:ts": "tsc --project tsconfig.json",
+    "build": "npm run build:wasm && npm run build:ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

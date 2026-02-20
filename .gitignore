@@ -1,3 +1,6 @@
 /target
 *.swp
 .DS_Store
+node_modules/
+crates/less-db-wasm/pkg/
+crates/less-db-wasm/js/dist/
