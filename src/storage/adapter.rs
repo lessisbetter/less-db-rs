@@ -21,7 +21,7 @@ use crate::{
     storage::{
         record_manager::{
             migrate_and_deserialize, prepare_delete, prepare_mark_synced,
-            prepare_new, prepare_patch,
+            prepare_new, prepare_patch, prepare_update,
         },
         remote_changes::{apply_remote_decisions, process_remote_record, RemoteDecision},
         traits::{StorageBackend, StorageLifecycle, StorageRead, StorageSync, StorageWrite},
@@ -272,9 +272,22 @@ impl<B: StorageBackend> Adapter<B> {
 
             match self.process_record(raw.clone(), true) {
                 Ok(stored) => {
-                    data_records.push(stored.data);
-                    // Re-use the potentially-migrated data to rebuild a SerializedRecord
-                    migrated_records.push(raw);
+                    data_records.push(stored.data.clone());
+                    // Build a SerializedRecord from the migrated result
+                    migrated_records.push(SerializedRecord {
+                        id: stored.id,
+                        collection: stored.collection,
+                        version: stored.version,
+                        data: stored.data,
+                        crdt: stored.crdt,
+                        pending_patches: stored.pending_patches,
+                        sequence: stored.sequence,
+                        dirty: stored.dirty,
+                        deleted: stored.deleted,
+                        deleted_at: stored.deleted_at,
+                        meta: stored.meta,
+                        computed: raw.computed,
+                    });
                 }
                 Err(e) => {
                     errors.push(serde_json::json!({
@@ -515,6 +528,8 @@ impl<B: StorageBackend> StorageWrite for Adapter<B> {
         data: Value,
         opts: &PutOptions,
     ) -> Result<StoredRecordWithMeta> {
+        use crate::storage::record_manager::try_extract_id;
+
         self.check_initialized()?;
 
         let session_id = if let Some(sid) = opts.session_id {
@@ -523,26 +538,92 @@ impl<B: StorageBackend> StorageWrite for Adapter<B> {
             self.get_or_create_session_id()?
         };
 
-        let result = prepare_new(def, data, session_id, opts)?;
+        // Upsert: if data contains an ID and that record exists, update instead
+        let id = opts
+            .id
+            .clone()
+            .or_else(|| try_extract_id(&def.current_schema, &data));
 
-        if !opts.skip_unique_check {
-            self.check_unique_constraints(
-                def,
-                &result.record.data,
-                result.record.computed.as_ref(),
-                None,
-            )?;
+        let existing = if let Some(ref id) = id {
+            self.backend.get_raw(&def.name, id)?
+        } else {
+            None
+        };
+
+        // Throw if trying to put into a deleted record
+        if let Some(ref existing) = existing {
+            if existing.deleted {
+                return Err(LessDbError::Storage(StorageError::Deleted {
+                    collection: def.name.clone(),
+                    id: existing.id.clone(),
+                }));
+            }
         }
 
-        self.backend.put_raw(&result.record)?;
+        if let Some(ref existing) = existing {
+            // Update existing record — merge auto-fields from existing data so
+            // callers don't need to echo back id/createdAt in the new document.
+            let merged_data = {
+                let mut base = existing.data.as_object().cloned().unwrap_or_default();
+                if let Some(new_obj) = data.as_object() {
+                    for (k, v) in new_obj {
+                        base.insert(k.clone(), v.clone());
+                    }
+                }
+                Value::Object(base)
+            };
+            let patch_opts = PatchOptions {
+                id: existing.id.clone(),
+                session_id: opts.session_id,
+                skip_unique_check: opts.skip_unique_check,
+                meta: opts.meta.clone(),
+                should_reset_sync_state: opts.should_reset_sync_state.clone(),
+            };
+            let result = prepare_update(def, existing, merged_data, session_id, &patch_opts)?;
 
-        let data = result.record.data.clone();
-        Ok(Self::to_stored_record_with_meta(
-            result.record,
-            data,
-            false,
-            None,
-        ))
+            if result.has_changes {
+                if !opts.skip_unique_check {
+                    self.check_unique_constraints(
+                        def,
+                        &result.record.data,
+                        result.record.computed.as_ref(),
+                        Some(&existing.id),
+                    )?;
+                }
+
+                self.backend.put_raw(&result.record)?;
+            }
+
+            let data = result.record.data.clone();
+            Ok(Self::to_stored_record_with_meta(
+                result.record,
+                data,
+                false,
+                None,
+            ))
+        } else {
+            // Insert new record
+            let result = prepare_new(def, data, session_id, opts)?;
+
+            if !opts.skip_unique_check {
+                self.check_unique_constraints(
+                    def,
+                    &result.record.data,
+                    result.record.computed.as_ref(),
+                    None,
+                )?;
+            }
+
+            self.backend.put_raw(&result.record)?;
+
+            let data = result.record.data.clone();
+            Ok(Self::to_stored_record_with_meta(
+                result.record,
+                data,
+                false,
+                None,
+            ))
+        }
     }
 
     fn patch(
@@ -578,16 +659,18 @@ impl<B: StorageBackend> StorageWrite for Adapter<B> {
 
         let result = prepare_patch(def, &existing, data, session_id, opts)?;
 
-        if !opts.skip_unique_check {
-            self.check_unique_constraints(
-                def,
-                &result.record.data,
-                result.record.computed.as_ref(),
-                Some(&opts.id),
-            )?;
-        }
+        if result.has_changes {
+            if !opts.skip_unique_check {
+                self.check_unique_constraints(
+                    def,
+                    &result.record.data,
+                    result.record.computed.as_ref(),
+                    Some(&opts.id),
+                )?;
+            }
 
-        self.backend.put_raw(&result.record)?;
+            self.backend.put_raw(&result.record)?;
+        }
 
         let data = result.record.data.clone();
         Ok(Self::to_stored_record_with_meta(

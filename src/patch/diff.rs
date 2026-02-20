@@ -1,10 +1,16 @@
 use serde_json::Value;
 use std::collections::BTreeMap;
+use thiserror::Error;
 
 use super::changeset::{create_changeset, Changeset};
 use crate::schema::node::{LiteralValue, SchemaNode};
 
 const MAX_DIFF_DEPTH: usize = 100;
+
+/// Error returned when diff/equals operations exceed the maximum nesting depth.
+#[derive(Debug, Error)]
+#[error("Maximum diff depth exceeded ({MAX_DIFF_DEPTH})")]
+pub struct DiffDepthError;
 
 // ============================================================================
 // Public API
@@ -13,11 +19,13 @@ const MAX_DIFF_DEPTH: usize = 100;
 /// Compute differences between old and new values given an object schema.
 /// Returns a Changeset of dot-notation paths that changed.
 /// `schema` is the properties map of an Object node.
+///
+/// Returns `Err(DiffDepthError)` if the schema nesting exceeds `MAX_DIFF_DEPTH`.
 pub fn diff(
     schema: &BTreeMap<String, SchemaNode>,
     old_value: &Value,
     new_value: &Value,
-) -> Changeset {
+) -> Result<Changeset, DiffDepthError> {
     let object_schema = SchemaNode::Object(schema.clone());
     let mut changes = create_changeset();
     let mut path: Vec<String> = Vec::new();
@@ -28,12 +36,14 @@ pub fn diff(
         &mut changes,
         &mut path,
         0,
-    );
-    changes
+    )?;
+    Ok(changes)
 }
 
 /// Check if two values are equal according to a schema node.
-pub fn node_equals(schema: &SchemaNode, a: &Value, b: &Value) -> bool {
+///
+/// Returns `Err(DiffDepthError)` if the schema nesting exceeds `MAX_DIFF_DEPTH`.
+pub fn node_equals(schema: &SchemaNode, a: &Value, b: &Value) -> Result<bool, DiffDepthError> {
     values_equal(schema, a, b, 0)
 }
 
@@ -64,9 +74,9 @@ fn diff_node(
     changes: &mut Changeset,
     path: &mut Vec<String>,
     depth: usize,
-) {
+) -> Result<(), DiffDepthError> {
     if depth > MAX_DIFF_DEPTH {
-        return;
+        return Err(DiffDepthError);
     }
 
     match schema {
@@ -108,21 +118,21 @@ fn diff_node(
                 }
                 (false, false) => {
                     // Both present — recurse on inner schema
-                    diff_node(inner, old_val, new_val, changes, path, depth + 1);
+                    diff_node(inner, old_val, new_val, changes, path, depth + 1)?;
                 }
             }
         }
 
         // Array: tracked at container level
         SchemaNode::Array(element_schema) => {
-            if !arrays_equal(element_schema, old_val, new_val, depth) {
+            if !arrays_equal(element_schema, old_val, new_val, depth)? {
                 add_change(changes, path);
             }
         }
 
         // Record: tracked at container level
         SchemaNode::Record(value_schema) => {
-            if !records_equal(value_schema, old_val, new_val, depth) {
+            if !records_equal(value_schema, old_val, new_val, depth)? {
                 add_change(changes, path);
             }
         }
@@ -137,7 +147,7 @@ fn diff_node(
                 let new_child = new_obj.and_then(|o| o.get(key)).unwrap_or(&Value::Null);
 
                 path.push(key.clone());
-                diff_node(prop_schema, old_child, new_child, changes, path, depth + 1);
+                diff_node(prop_schema, old_child, new_child, changes, path, depth + 1)?;
                 path.pop();
             }
         }
@@ -165,21 +175,27 @@ fn diff_node(
                         add_change(changes, path);
                     } else {
                         // Same variant — recurse
-                        diff_node(ov, old_val, new_val, changes, path, depth + 1);
+                        diff_node(ov, old_val, new_val, changes, path, depth + 1)?;
                     }
                 }
             }
         }
     }
+    Ok(())
 }
 
 // ============================================================================
 // Deep equality helpers
 // ============================================================================
 
-fn values_equal(schema: &SchemaNode, a: &Value, b: &Value, depth: usize) -> bool {
+fn values_equal(
+    schema: &SchemaNode,
+    a: &Value,
+    b: &Value,
+    depth: usize,
+) -> Result<bool, DiffDepthError> {
     if depth > MAX_DIFF_DEPTH {
-        return a == b;
+        return Err(DiffDepthError);
     }
 
     match schema {
@@ -192,12 +208,12 @@ fn values_equal(schema: &SchemaNode, a: &Value, b: &Value, depth: usize) -> bool
         | SchemaNode::Date
         | SchemaNode::CreatedAt
         | SchemaNode::UpdatedAt
-        | SchemaNode::Bytes => a == b,
+        | SchemaNode::Bytes => Ok(a == b),
 
         SchemaNode::Optional(inner) => match (a.is_null(), b.is_null()) {
-            (true, true) => true,
+            (true, true) => Ok(true),
             (false, false) => values_equal(inner, a, b, depth + 1),
-            _ => false,
+            _ => Ok(false),
         },
 
         SchemaNode::Array(element_schema) => arrays_equal(element_schema, a, b, depth),
@@ -207,20 +223,20 @@ fn values_equal(schema: &SchemaNode, a: &Value, b: &Value, depth: usize) -> bool
         SchemaNode::Object(props) => {
             let a_obj = match a.as_object() {
                 Some(o) => o,
-                None => return a == b,
+                None => return Ok(a == b),
             };
             let b_obj = match b.as_object() {
                 Some(o) => o,
-                None => return false,
+                None => return Ok(false),
             };
             for (key, prop_schema) in props {
                 let av = a_obj.get(key).unwrap_or(&Value::Null);
                 let bv = b_obj.get(key).unwrap_or(&Value::Null);
-                if !values_equal(prop_schema, av, bv, depth + 1) {
-                    return false;
+                if !values_equal(prop_schema, av, bv, depth + 1)? {
+                    return Ok(false);
                 }
             }
-            true
+            Ok(true)
         }
 
         SchemaNode::Union(variants) => {
@@ -228,54 +244,66 @@ fn values_equal(schema: &SchemaNode, a: &Value, b: &Value, depth: usize) -> bool
             let b_variant = variants.iter().find(|v| matches_variant(v, b));
             match (a_variant, b_variant) {
                 (Some(av), Some(bv)) if av == bv => values_equal(av, a, b, depth + 1),
-                (None, None) => a == b,
-                _ => false,
+                (None, None) => Ok(a == b),
+                _ => Ok(false),
             }
         }
     }
 }
 
-fn arrays_equal(element_schema: &SchemaNode, a: &Value, b: &Value, depth: usize) -> bool {
+fn arrays_equal(
+    element_schema: &SchemaNode,
+    a: &Value,
+    b: &Value,
+    depth: usize,
+) -> Result<bool, DiffDepthError> {
     let a_arr = match a.as_array() {
         Some(arr) => arr,
-        None => return a == b,
+        None => return Ok(a == b),
     };
     let b_arr = match b.as_array() {
         Some(arr) => arr,
-        None => return false,
+        None => return Ok(false),
     };
     if a_arr.len() != b_arr.len() {
-        return false;
+        return Ok(false);
     }
-    a_arr
-        .iter()
-        .zip(b_arr.iter())
-        .all(|(av, bv)| values_equal(element_schema, av, bv, depth + 1))
+    for (av, bv) in a_arr.iter().zip(b_arr.iter()) {
+        if !values_equal(element_schema, av, bv, depth + 1)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-fn records_equal(value_schema: &SchemaNode, a: &Value, b: &Value, depth: usize) -> bool {
+fn records_equal(
+    value_schema: &SchemaNode,
+    a: &Value,
+    b: &Value,
+    depth: usize,
+) -> Result<bool, DiffDepthError> {
     let a_obj = match a.as_object() {
         Some(o) => o,
-        None => return a == b,
+        None => return Ok(a == b),
     };
     let b_obj = match b.as_object() {
         Some(o) => o,
-        None => return false,
+        None => return Ok(false),
     };
     if a_obj.len() != b_obj.len() {
-        return false;
+        return Ok(false);
     }
     for (key, av) in a_obj {
         match b_obj.get(key) {
-            None => return false,
+            None => return Ok(false),
             Some(bv) => {
-                if !values_equal(value_schema, av, bv, depth + 1) {
-                    return false;
+                if !values_equal(value_schema, av, bv, depth + 1)? {
+                    return Ok(false);
                 }
             }
         }
     }
-    true
+    Ok(true)
 }
 
 // ============================================================================

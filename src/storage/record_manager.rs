@@ -43,6 +43,9 @@ pub struct PrepareUpdateResult {
     pub record: SerializedRecord,
     /// Top-level fields that changed (from the schema diff).
     pub changed_fields: BTreeSet<String>,
+    /// Whether the record actually changed (data or meta). When false, the
+    /// caller should skip the write to avoid a no-op updatedAt bump.
+    pub has_changes: bool,
 }
 
 /// Result of deserializing and migrating a record from storage.
@@ -248,7 +251,16 @@ pub fn prepare_update(
     )?;
 
     // Diff user fields (top-level non-updatedAt fields)
-    let changed_fields = diff_user_fields(&def.current_schema, &existing.data, &new_data);
+    let changed_fields = diff_user_fields(&def.current_schema, &existing.data, &new_data)?;
+
+    // No changes at all: return existing record unchanged so caller can skip write
+    if changed_fields.is_empty() && !meta_changed {
+        return Ok(PrepareUpdateResult {
+            record: existing.clone(),
+            changed_fields,
+            has_changes: false,
+        });
+    }
 
     // Meta-only change path: if no data fields changed but meta did, return
     // early with dirty=true and merged meta (skip CRDT diff).
@@ -268,6 +280,7 @@ pub fn prepare_update(
         return Ok(PrepareUpdateResult {
             record,
             changed_fields,
+            has_changes: true,
         });
     }
 
@@ -336,6 +349,7 @@ pub fn prepare_update(
     Ok(PrepareUpdateResult {
         record,
         changed_fields,
+        has_changes: true,
     })
 }
 
@@ -590,7 +604,8 @@ fn normalize_index_value_from_indexable(val: Option<IndexableValue>) -> Value {
 pub fn normalize_index_value(value: &Value) -> Value {
     match value {
         Value::Null => Value::Null,
-        Value::Bool(b) => Value::Bool(*b),
+        // Match JS behavior: booleans stored as 0/1 in index for SQLite compatibility
+        Value::Bool(b) => Value::Number(serde_json::Number::from(if *b { 1 } else { 0 })),
         Value::Number(_) => value.clone(),
         Value::String(s) => Value::String(s.clone()),
         Value::Array(_) | Value::Object(_) => Value::Null,
@@ -971,11 +986,11 @@ fn diff_user_fields(
     schema: &std::collections::BTreeMap<String, SchemaNode>,
     old_value: &Value,
     new_value: &Value,
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>, crate::error::LessDbError> {
     use crate::patch::diff::diff;
-    let changeset = diff(schema, old_value, new_value);
+    let changeset = diff(schema, old_value, new_value)?;
 
-    changeset
+    Ok(changeset
         .into_iter()
         .filter(|field| {
             // Exclude updatedAt (auto-managed)
@@ -985,7 +1000,7 @@ fn diff_user_fields(
                 true
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Deep equality for CRDT model views (property-order-insensitive).

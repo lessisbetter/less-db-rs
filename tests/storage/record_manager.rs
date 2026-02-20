@@ -552,8 +552,9 @@ fn normalize_index_value_passes_through_primitives() {
     assert_eq!(normalize_index_value(&json!(null)), json!(null));
     assert_eq!(normalize_index_value(&json!("hello")), json!("hello"));
     assert_eq!(normalize_index_value(&json!(42.0)), json!(42.0));
-    assert_eq!(normalize_index_value(&json!(true)), json!(true));
-    assert_eq!(normalize_index_value(&json!(false)), json!(false));
+    // Booleans are converted to 0/1 for SQLite index storage (matches JS behavior)
+    assert_eq!(normalize_index_value(&json!(true)), json!(1));
+    assert_eq!(normalize_index_value(&json!(false)), json!(0));
 }
 
 #[test]

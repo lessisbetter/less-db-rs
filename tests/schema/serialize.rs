@@ -322,3 +322,153 @@ fn round_trip_complex_object() {
     assert_eq!(deserialized["createdAt"], json!("2024-01-01T00:00:00.000Z"));
     assert_eq!(deserialized["updatedAt"], json!("2024-01-15T10:30:00.000Z"));
 }
+
+// ============================================================================
+// Text type
+// ============================================================================
+
+#[test]
+fn serialize_text_passthrough() {
+    assert_eq!(serialize(&t::text(), &json!("hello world")), json!("hello world"));
+}
+
+#[test]
+fn deserialize_text_passthrough() {
+    assert_eq!(deserialize(&t::text(), &json!("hello world")), json!("hello world"));
+}
+
+// ============================================================================
+// Deserialize union variants
+// ============================================================================
+
+#[test]
+fn deserialize_union_string_variant() {
+    let schema = t::union(vec![t::string(), t::number()]);
+    assert_eq!(deserialize(&schema, &json!("hello")), json!("hello"));
+}
+
+#[test]
+fn deserialize_union_number_variant() {
+    let schema = t::union(vec![t::string(), t::number()]);
+    assert_eq!(deserialize(&schema, &json!(42)), json!(42));
+}
+
+#[test]
+fn deserialize_union_no_match_passes_through() {
+    // No variant matches a boolean — deserialize returns value as-is
+    let schema = t::union(vec![t::string(), t::number()]);
+    assert_eq!(deserialize(&schema, &json!(true)), json!(true));
+}
+
+#[test]
+fn deserialize_union_with_optional_variant() {
+    let schema = t::union(vec![t::optional(t::string()), t::number()]);
+    // Null matches optional variant
+    assert_eq!(deserialize(&schema, &Value::Null), Value::Null);
+    // String matches optional(string)
+    assert_eq!(deserialize(&schema, &json!("hello")), json!("hello"));
+    // Number matches number variant
+    assert_eq!(deserialize(&schema, &json!(42)), json!(42));
+}
+
+// ============================================================================
+// Deserialize object edge cases
+// ============================================================================
+
+#[test]
+fn deserialize_object_missing_optional_properties_omitted() {
+    let mut props = BTreeMap::new();
+    props.insert("required".to_string(), t::string());
+    props.insert("optional".to_string(), t::optional(t::string()));
+    let schema = t::object(props);
+
+    // Only "required" is present; "optional" is absent from input
+    let value = json!({"required": "hello"});
+    let result = deserialize(&schema, &value);
+    assert_eq!(result["required"], json!("hello"));
+    // Absent optional field is not synthesized
+    assert!(result.get("optional").is_none());
+}
+
+#[test]
+fn deserialize_object_extra_properties_stripped() {
+    let mut props = BTreeMap::new();
+    props.insert("name".to_string(), t::string());
+    let schema = t::object(props);
+
+    let value = json!({"name": "Alice", "extra": 42});
+    let result = deserialize(&schema, &value);
+    assert_eq!(result["name"], json!("Alice"));
+    assert!(result.get("extra").is_none());
+}
+
+// ============================================================================
+// Empty collections
+// ============================================================================
+
+#[test]
+fn serialize_empty_array() {
+    let result = serialize(&t::array(t::number()), &json!([]));
+    assert_eq!(result, json!([]));
+}
+
+#[test]
+fn serialize_empty_object() {
+    let schema = t::object(BTreeMap::new());
+    let result = serialize(&schema, &json!({}));
+    assert_eq!(result, json!({}));
+}
+
+#[test]
+fn deserialize_empty_array() {
+    let result = deserialize(&t::array(t::number()), &json!([]));
+    assert_eq!(result, json!([]));
+}
+
+#[test]
+fn deserialize_empty_record() {
+    let result = deserialize(&t::record(t::number()), &json!({}));
+    assert_eq!(result, json!({}));
+}
+
+// ============================================================================
+// Record in union (matches_serialized_variant)
+// ============================================================================
+
+#[test]
+fn deserialize_record_in_union() {
+    let schema = t::union(vec![t::record(t::number()), t::string()]);
+    // Object matches record variant
+    assert_eq!(
+        deserialize(&schema, &json!({"a": 1, "b": 2})),
+        json!({"a": 1, "b": 2})
+    );
+    // String matches string variant
+    assert_eq!(deserialize(&schema, &json!("hello")), json!("hello"));
+}
+
+// ============================================================================
+// Nested structure round-trip
+// ============================================================================
+
+#[test]
+fn round_trip_nested_array_of_objects() {
+    let mut item_props = BTreeMap::new();
+    item_props.insert("id".to_string(), t::string());
+    item_props.insert("count".to_string(), t::optional(t::number()));
+    let schema = t::array(t::object(item_props));
+
+    let value = json!([
+        {"id": "a", "count": 5},
+        {"id": "b", "count": null}
+    ]);
+
+    let serialized = serialize(&schema, &value);
+    let deserialized = deserialize(&schema, &serialized);
+
+    assert_eq!(deserialized[0]["id"], json!("a"));
+    assert_eq!(deserialized[0]["count"], json!(5));
+    assert_eq!(deserialized[1]["id"], json!("b"));
+    // null optional was skipped in serialize
+    assert!(deserialized[1].get("count").is_none());
+}

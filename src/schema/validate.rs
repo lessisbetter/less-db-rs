@@ -104,7 +104,7 @@ fn is_valid_iso_date(s: &str) -> bool {
 
 /// Validate base64: length divisible by 4, valid character set.
 fn is_valid_base64(s: &str) -> bool {
-    if !s.len().is_multiple_of(4) {
+    if s.len() % 4 != 0 {
         return false;
     }
     STANDARD.decode(s).is_ok()
@@ -142,7 +142,7 @@ fn walk(schema: &SchemaNode, value: &Value, ctx: &mut ValidationContext, depth: 
             if value.is_number() {
                 value.clone()
             } else {
-                ctx.add_error("finite number", type_name(value));
+                ctx.add_error("number", type_name(value));
                 value.clone()
             }
         }

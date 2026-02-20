@@ -65,3 +65,27 @@ This file documents intentional differences between the Rust port and the origin
 - **JS**: `serializeForCrdt` wraps atomic string values with `jsonCrdtSchema.con(value)` NodeBuilder objects embedded in the data, which `model.api.set()` recognizes and builds as con (LWW) nodes.
 - **Rust**: `create_model_with_schema` uses `PatchBuilder` directly to build the CRDT structure, choosing `builder.con_val()` for atomic fields and `builder.str_node()`/`builder.ins_str()` for text fields. `serialize_for_crdt` only handles date→epoch-ms conversion.
 - **Why**: `serde_json::Value` cannot represent `NodeBuilder` objects. The Rust approach builds correct node types via the lower-level `PatchBuilder` API instead of embedding type hints in the data.
+
+---
+
+## Divergence: Union variant matching for Date/Bytes types
+
+- **JS**: `matchesVariant` for `date` checks `value instanceof Date` (native Date object), and for `bytes` checks `value instanceof Uint8Array`. These are strict structural type checks that distinguish dates from plain strings.
+- **Rust**: `matches_variant` for `Date`/`Bytes` checks `value.is_string()`. Since dates are ISO strings and bytes are base64 strings in `serde_json::Value`, there is no structural distinction from `String`. In a union like `union(date, string)`, the `date` variant always matches first for any string.
+- **Why**: `serde_json::Value` has no `Date` or `Uint8Array` variant. ISO-format checking in `matches_variant` would add cost and change semantics (non-ISO strings would fall through to `string` variant instead of matching `date`). Users should avoid `union(date, string)` in Rust — use `string` alone since dates are strings.
+
+---
+
+## Divergence: Session ID metadata key
+
+- **JS**: Session ID stored under metadata key `"crdt:sessionId"`.
+- **Rust**: Session ID stored under metadata key `"session_id"`.
+- **Why**: The namespaced key convention (`crdt:`) is a JS-side convention. The Rust port uses a simpler snake_case key. Cross-implementation database sharing is not a supported use case.
+
+---
+
+## Divergence: `diff` / `node_equals` return `Result` instead of panicking on depth exceeded
+
+- **JS**: `diff()` and `equals()` throw an `Error` when `MAX_DIFF_DEPTH` is exceeded.
+- **Rust**: `diff()` returns `Result<Changeset, DiffDepthError>` and `node_equals()` returns `Result<bool, DiffDepthError>`. Callers must handle the error.
+- **Why**: Panicking in a library function is not idiomatic Rust. Returning `Result` lets callers decide how to handle depth overflow (propagate, log, etc.) instead of crashing the thread.

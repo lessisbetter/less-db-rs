@@ -620,7 +620,7 @@ impl StorageBackend for SqliteBackend {
                 self.with_conn(|conn| {
                     conn.query_row(
                         "SELECT COUNT(*) FROM records WHERE collection = ?1 AND deleted = 1 \
-                         AND deleted_at < datetime('now', ?2)",
+                         AND deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)",
                         params![collection, format!("-{secs} seconds")],
                         |row| row.get::<_, i64>(0),
                     )
@@ -642,7 +642,7 @@ impl StorageBackend for SqliteBackend {
             self.with_conn(|conn| {
                 conn.execute(
                     "DELETE FROM records WHERE collection = ?1 AND deleted = 1 \
-                     AND deleted_at < datetime('now', ?2)",
+                     AND deleted_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)",
                     params![collection, format!("-{secs} seconds")],
                 )
                 .map(|n| n as usize)

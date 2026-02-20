@@ -210,6 +210,9 @@ pub enum LessDbError {
     #[error(transparent)]
     Sync(#[from] SyncError),
 
+    #[error(transparent)]
+    DiffDepth(#[from] crate::patch::diff::DiffDepthError),
+
     #[error("CRDT error: {0}")]
     Crdt(String),
 
