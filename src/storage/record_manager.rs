@@ -170,6 +170,53 @@ pub fn prepare_new(
 }
 
 // ============================================================================
+// Meta Helpers
+// ============================================================================
+
+/// Shallow-merge new meta onto existing meta. Returns the merged result.
+///
+/// If both are objects, new keys override existing keys. If either is missing,
+/// the other is returned as-is.
+fn merge_meta(existing: &Option<Value>, new: &Option<Value>) -> Option<Value> {
+    if let Some(ref n) = new {
+        debug_assert!(
+            n.is_object() || n.is_null(),
+            "middleware meta must be a JSON object, got: {n:?}"
+        );
+    }
+
+    match (existing, new) {
+        (_, None) => existing.clone(),
+        (None, Some(n)) => {
+            // Only store non-empty objects
+            if n.as_object().map_or(true, |o| o.is_empty()) {
+                None
+            } else {
+                Some(n.clone())
+            }
+        }
+        (Some(e), Some(n)) => {
+            let mut merged = e.as_object().cloned().unwrap_or_default();
+            if let Some(new_obj) = n.as_object() {
+                for (k, v) in new_obj {
+                    merged.insert(k.clone(), v.clone());
+                }
+            }
+            if merged.is_empty() {
+                None
+            } else {
+                Some(Value::Object(merged))
+            }
+        }
+    }
+}
+
+/// Check if meta has changed between existing and merged values.
+fn has_meta_changed(existing: &Option<Value>, merged: &Option<Value>) -> bool {
+    existing != merged
+}
+
+// ============================================================================
 // Update Preparation
 // ============================================================================
 
@@ -182,9 +229,14 @@ pub fn prepare_update(
     existing: &SerializedRecord,
     new_data: Value,
     session_id: u64,
-    _opts: &PatchOptions,
+    opts: &PatchOptions,
 ) -> Result<PrepareUpdateResult> {
     debug_assert!(!existing.deleted, "prepare_update called on a tombstone record");
+
+    // Merge meta from options onto existing meta
+    let merged_meta = merge_meta(&existing.meta, &opts.meta);
+    let meta_changed = has_meta_changed(&existing.meta, &merged_meta);
+
     // Check immutable fields
     check_immutable_fields(
         &def.name,
@@ -196,6 +248,27 @@ pub fn prepare_update(
 
     // Diff user fields (top-level non-updatedAt fields)
     let changed_fields = diff_user_fields(&def.current_schema, &existing.data, &new_data);
+
+    // Meta-only change path: if no data fields changed but meta did, return
+    // early with dirty=true and merged meta (skip CRDT diff).
+    if changed_fields.is_empty() && meta_changed {
+        let mut record = existing.clone();
+        record.meta = merged_meta.clone();
+        record.dirty = true;
+
+        // Apply should_reset_sync_state if provided
+        if let Some(ref should_reset) = opts.should_reset_sync_state {
+            if should_reset(existing.meta.as_ref(), merged_meta.as_ref().unwrap_or(&Value::Null)) {
+                record.sequence = 0;
+                record.pending_patches = EMPTY_PATCH_LOG.to_vec();
+            }
+        }
+
+        return Ok(PrepareUpdateResult {
+            record,
+            changed_fields,
+        });
+    }
 
     // Z-format timestamp for schema validator compatibility
     let now = utc_now_z();
@@ -231,18 +304,31 @@ pub fn prepare_update(
         (existing.crdt.clone(), existing.pending_patches.clone())
     };
 
+    let mut sequence = existing.sequence;
+    let mut final_pending = pending_patches;
+
+    // Apply should_reset_sync_state if provided and meta changed
+    if meta_changed {
+        if let Some(ref should_reset) = opts.should_reset_sync_state {
+            if should_reset(existing.meta.as_ref(), merged_meta.as_ref().unwrap_or(&Value::Null)) {
+                sequence = 0;
+                final_pending = EMPTY_PATCH_LOG.to_vec();
+            }
+        }
+    }
+
     let record = SerializedRecord {
         id: existing.id.clone(),
         collection: def.name.clone(),
         version: def.current_version,
         data: validated,
         crdt: crdt_binary,
-        pending_patches,
-        sequence: existing.sequence,
+        pending_patches: final_pending,
+        sequence,
         dirty: true,
         deleted: false,
         deleted_at: None,
-        meta: existing.meta.clone(),
+        meta: merged_meta,
         computed,
     };
 
@@ -305,13 +391,16 @@ pub fn prepare_patch(
 /// Prepare a soft-delete tombstone from an existing record.
 ///
 /// Marks the record as deleted and dirty. CRDT state is retained for resurrection.
-pub fn prepare_delete(existing: &SerializedRecord, _opts: &DeleteOptions) -> SerializedRecord {
+/// If `opts.meta` is provided, it is shallow-merged onto the existing meta.
+pub fn prepare_delete(existing: &SerializedRecord, opts: &DeleteOptions) -> SerializedRecord {
     let now = utc_now_z();
+    let merged_meta = merge_meta(&existing.meta, &opts.meta);
 
     SerializedRecord {
         deleted: true,
         deleted_at: Some(now),
         dirty: true,
+        meta: merged_meta,
         // Keep existing CRDT state
         ..existing.clone()
     }

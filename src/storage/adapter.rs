@@ -696,6 +696,7 @@ impl<B: StorageBackend> StorageWrite for Adapter<B> {
                 session_id: opts.session_id,
                 skip_unique_check: opts.skip_unique_check,
                 meta: opts.meta.clone(),
+                should_reset_sync_state: opts.should_reset_sync_state.clone(),
             };
 
             match self.patch(def, patch_data, &patch_opts) {
@@ -773,6 +774,7 @@ impl<B: StorageBackend> StorageWrite for Adapter<B> {
                 session_id: opts.session_id,
                 skip_unique_check: opts.skip_unique_check,
                 meta: opts.meta.clone(),
+                should_reset_sync_state: opts.should_reset_sync_state.clone(),
             };
 
             match self.patch(def, patch.clone(), &patch_opts) {

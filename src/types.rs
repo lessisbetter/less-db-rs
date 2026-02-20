@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -200,7 +202,6 @@ pub enum DeleteResolution {
 // ============================================================================
 
 /// Options for put() operation
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PutOptions {
     /// Override record ID instead of auto-generating
     pub id: Option<String>,
@@ -210,22 +211,99 @@ pub struct PutOptions {
     pub skip_unique_check: bool,
     /// Middleware metadata
     pub meta: Option<Value>,
+    /// Middleware hook: returns true → sequence resets to 0, pending_patches cleared.
+    pub should_reset_sync_state: Option<Arc<dyn Fn(Option<&Value>, &Value) -> bool + Send + Sync>>,
+}
+
+impl Default for PutOptions {
+    fn default() -> Self {
+        Self {
+            id: None,
+            session_id: None,
+            skip_unique_check: false,
+            meta: None,
+            should_reset_sync_state: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for PutOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PutOptions")
+            .field("id", &self.id)
+            .field("session_id", &self.session_id)
+            .field("skip_unique_check", &self.skip_unique_check)
+            .field("meta", &self.meta)
+            .field("should_reset_sync_state", &self.should_reset_sync_state.as_ref().map(|_| "..."))
+            .finish()
+    }
+}
+
+impl Clone for PutOptions {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            session_id: self.session_id,
+            skip_unique_check: self.skip_unique_check,
+            meta: self.meta.clone(),
+            should_reset_sync_state: self.should_reset_sync_state.clone(),
+        }
+    }
 }
 
 /// Options for patch() operation
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PatchOptions {
     pub id: String,
     pub session_id: Option<u64>,
     pub skip_unique_check: bool,
     pub meta: Option<Value>,
+    /// Middleware hook: returns true → sequence resets to 0, pending_patches cleared.
+    pub should_reset_sync_state: Option<Arc<dyn Fn(Option<&Value>, &Value) -> bool + Send + Sync>>,
+}
+
+impl Default for PatchOptions {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            session_id: None,
+            skip_unique_check: false,
+            meta: None,
+            should_reset_sync_state: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for PatchOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PatchOptions")
+            .field("id", &self.id)
+            .field("session_id", &self.session_id)
+            .field("skip_unique_check", &self.skip_unique_check)
+            .field("meta", &self.meta)
+            .field("should_reset_sync_state", &self.should_reset_sync_state.as_ref().map(|_| "..."))
+            .finish()
+    }
+}
+
+impl Clone for PatchOptions {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            session_id: self.session_id,
+            skip_unique_check: self.skip_unique_check,
+            meta: self.meta.clone(),
+            should_reset_sync_state: self.should_reset_sync_state.clone(),
+        }
+    }
 }
 
 /// Options for delete() operation
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DeleteOptions {
     pub id: String,
     pub session_id: Option<u64>,
+    /// Middleware metadata to merge onto the tombstone
+    pub meta: Option<Value>,
 }
 
 /// Options for get() operation
