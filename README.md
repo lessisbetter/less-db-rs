@@ -21,20 +21,14 @@ A local-first document store with CRDT sync, schema migrations, and reactive que
 ## Quick start (browser)
 
 ```typescript
-import * as wasm from "less-db-wasm/pkg";
-import { createLessDb, t, IndexedDbBackend } from "less-db-wasm";
-
-const { collection, createDb } = createLessDb(wasm);
+import { collection, t, createDb } from "less-db-wasm";
 
 const users = collection("users")
   .v(1, { name: t.string(), email: t.string() })
   .index(["email"], { unique: true })
   .build();
 
-const backend = await IndexedDbBackend.open("my-app");
-const db = createDb(backend);
-db.initialize([users]);
-
+const db = await createDb("my-app", [users]);
 const alice = db.put(users, { name: "Alice", email: "alice@example.com" });
 const found = db.get(users, alice.id);
 const results = db.query(users, { filter: { name: "Alice" } });

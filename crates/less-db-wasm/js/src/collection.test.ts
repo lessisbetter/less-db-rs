@@ -1,46 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
-import { createCollectionFactory } from "./collection.js";
+import { describe, it, expect } from "vitest";
+import { collection } from "./collection.js";
 import { t } from "./schema.js";
-
-// ============================================================================
-// Mock WasmCollectionBuilder
-// ============================================================================
-
-function createMockBuilder() {
-  const calls: Array<{ method: string; args: unknown[] }> = [];
-
-  class MockWasmBuilder {
-    name: string;
-
-    constructor(name: string) {
-      this.name = name;
-      calls.push({ method: "constructor", args: [name] });
-    }
-
-    v1(schema: unknown) {
-      calls.push({ method: "v1", args: [schema] });
-    }
-
-    v(version: number, schema: unknown, migrate: unknown) {
-      calls.push({ method: "v", args: [version, schema, migrate] });
-    }
-
-    index(fields: string[], options: unknown) {
-      calls.push({ method: "index", args: [fields, options] });
-    }
-
-    computed(name: string, compute: unknown, options: unknown) {
-      calls.push({ method: "computed", args: [name, compute, options] });
-    }
-
-    build() {
-      calls.push({ method: "build", args: [] });
-      return { name: this.name, currentVersion: calls.filter((c) => c.method === "v1" || c.method === "v").length };
-    }
-  }
-
-  return { MockWasmBuilder, calls };
-}
+import { BLUEPRINT } from "./types.js";
 
 // ============================================================================
 // Tests
@@ -52,21 +13,16 @@ describe("collection builder", () => {
   // --------------------------------------------------------------------------
 
   it("builds a single-version collection", () => {
-    const { MockWasmBuilder, calls } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
     const schema = { name: t.string(), email: t.string() };
     const def = collection("users").v(1, schema).build();
 
     expect(def.name).toBe("users");
     expect(def.currentVersion).toBe(1);
     expect(def.schema).toBe(schema);
-    expect(def._wasm).toBeDefined();
 
-    // Verify WASM calls
-    expect(calls[0]).toEqual({ method: "constructor", args: ["users"] });
-    expect(calls[1]).toEqual({ method: "v1", args: [schema] });
-    expect(calls[2]).toEqual({ method: "build", args: [] });
+    const bp = def[BLUEPRINT];
+    expect(bp.versions).toHaveLength(1);
+    expect(bp.versions[0]).toEqual({ version: 1, schema });
   });
 
   // --------------------------------------------------------------------------
@@ -74,9 +30,6 @@ describe("collection builder", () => {
   // --------------------------------------------------------------------------
 
   it("builds a multi-version collection with migrations", () => {
-    const { MockWasmBuilder, calls } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
     const v1Schema = { name: t.string() };
     const v2Schema = { name: t.string(), email: t.string() };
     const migrate = (data: Record<string, unknown>) => ({
@@ -93,11 +46,12 @@ describe("collection builder", () => {
     expect(def.currentVersion).toBe(2);
     expect(def.schema).toBe(v2Schema);
 
-    expect(calls[1]).toEqual({ method: "v1", args: [v1Schema] });
-    expect(calls[2].method).toBe("v");
-    expect(calls[2].args[0]).toBe(2);
-    expect(calls[2].args[1]).toBe(v2Schema);
-    expect(calls[2].args[2]).toBe(migrate);
+    const bp = def[BLUEPRINT];
+    expect(bp.versions).toHaveLength(2);
+    expect(bp.versions[0]).toEqual({ version: 1, schema: v1Schema });
+    expect(bp.versions[1].version).toBe(2);
+    expect(bp.versions[1].schema).toBe(v2Schema);
+    expect(bp.versions[1].migrate).toBe(migrate);
   });
 
   // --------------------------------------------------------------------------
@@ -105,32 +59,31 @@ describe("collection builder", () => {
   // --------------------------------------------------------------------------
 
   it("adds field indexes", () => {
-    const { MockWasmBuilder, calls } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
-    collection("users")
+    const def = collection("users")
       .v(1, { email: t.string(), name: t.string() })
       .index(["email"], { unique: true })
       .index(["name"])
       .build();
 
-    const indexCalls = calls.filter((c) => c.method === "index");
-    expect(indexCalls).toHaveLength(2);
-    expect(indexCalls[0].args).toEqual([["email"], { unique: true }]);
-    expect(indexCalls[1].args).toEqual([["name"], {}]);
+    const bp = def[BLUEPRINT];
+    const fieldIndexes = bp.indexes.filter((i) => i.type === "field");
+    expect(fieldIndexes).toHaveLength(2);
+    expect(fieldIndexes[0]).toEqual({ type: "field", fields: ["email"], options: { unique: true } });
+    expect(fieldIndexes[1]).toEqual({ type: "field", fields: ["name"], options: {} });
   });
 
   it("supports compound field indexes", () => {
-    const { MockWasmBuilder, calls } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
-    collection("users")
+    const def = collection("users")
       .v(1, { firstName: t.string(), lastName: t.string() })
       .index(["lastName", "firstName"])
       .build();
 
-    const indexCalls = calls.filter((c) => c.method === "index");
-    expect(indexCalls[0].args[0]).toEqual(["lastName", "firstName"]);
+    const bp = def[BLUEPRINT];
+    expect(bp.indexes[0]).toEqual({
+      type: "field",
+      fields: ["lastName", "firstName"],
+      options: {},
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -138,36 +91,35 @@ describe("collection builder", () => {
   // --------------------------------------------------------------------------
 
   it("adds computed indexes", () => {
-    const { MockWasmBuilder, calls } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
     const computeFn = (data: Record<string, unknown>) =>
       (data.name as string).toLowerCase();
 
-    collection("users")
+    const def = collection("users")
       .v(1, { name: t.string() })
       .computed("name_lower", computeFn, { unique: true })
       .build();
 
-    const computedCalls = calls.filter((c) => c.method === "computed");
-    expect(computedCalls).toHaveLength(1);
-    expect(computedCalls[0].args[0]).toBe("name_lower");
-    expect(computedCalls[0].args[1]).toBe(computeFn);
-    expect(computedCalls[0].args[2]).toEqual({ unique: true });
+    const bp = def[BLUEPRINT];
+    const computedIndexes = bp.indexes.filter((i) => i.type === "computed");
+    expect(computedIndexes).toHaveLength(1);
+    expect(computedIndexes[0]).toEqual({
+      type: "computed",
+      name: "name_lower",
+      compute: computeFn,
+      options: { unique: true },
+    });
   });
 
   it("computed with default options passes empty object", () => {
-    const { MockWasmBuilder, calls } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
     const fn = () => "val";
-    collection("items")
+    const def = collection("items")
       .v(1, { x: t.string() })
       .computed("c", fn)
       .build();
 
-    const computedCalls = calls.filter((c) => c.method === "computed");
-    expect(computedCalls[0].args[2]).toEqual({});
+    const bp = def[BLUEPRINT];
+    const computedIndexes = bp.indexes.filter((i) => i.type === "computed");
+    expect(computedIndexes[0].options).toEqual({});
   });
 
   // --------------------------------------------------------------------------
@@ -175,20 +127,18 @@ describe("collection builder", () => {
   // --------------------------------------------------------------------------
 
   it("fluent chaining: index + computed + index", () => {
-    const { MockWasmBuilder, calls } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
-    collection("users")
+    const def = collection("users")
       .v(1, { name: t.string(), email: t.string() })
       .index(["email"], { unique: true })
       .computed("slug", (d) => (d.name as string).toLowerCase())
       .index(["name"])
       .build();
 
-    const indexCalls = calls.filter((c) => c.method === "index");
-    const computedCalls = calls.filter((c) => c.method === "computed");
-    expect(indexCalls).toHaveLength(2);
-    expect(computedCalls).toHaveLength(1);
+    const bp = def[BLUEPRINT];
+    const fieldIndexes = bp.indexes.filter((i) => i.type === "field");
+    const computedIndexes = bp.indexes.filter((i) => i.type === "computed");
+    expect(fieldIndexes).toHaveLength(2);
+    expect(computedIndexes).toHaveLength(1);
   });
 
   // --------------------------------------------------------------------------
@@ -196,32 +146,30 @@ describe("collection builder", () => {
   // --------------------------------------------------------------------------
 
   it("indexes are reset when adding a new version", () => {
-    const { MockWasmBuilder, calls } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
-    collection("users")
+    const def = collection("users")
       .v(1, { name: t.string() })
       .index(["name"]) // attached to v1 builder
       .v(2, { name: t.string(), age: t.number() }, (d) => ({ ...d, age: 0 }))
       .index(["age"]) // attached to v2 builder — v1 indexes are gone
       .build();
 
-    const indexCalls = calls.filter((c) => c.method === "index");
+    const bp = def[BLUEPRINT];
     // Only v2's index should be present
-    expect(indexCalls).toHaveLength(1);
-    expect(indexCalls[0].args[0]).toEqual(["age"]);
+    expect(bp.indexes).toHaveLength(1);
+    expect(bp.indexes[0]).toEqual({ type: "field", fields: ["age"], options: {} });
   });
 
   // --------------------------------------------------------------------------
   // Return value
   // --------------------------------------------------------------------------
 
-  it("returned handle has _wasm from builder.build()", () => {
-    const { MockWasmBuilder } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
+  it("returned handle has blueprint with correct data", () => {
     const def = collection("tasks").v(1, { title: t.string() }).build();
-    expect(def._wasm).toEqual({ name: "tasks", currentVersion: 1 });
+
+    expect(def.name).toBe("tasks");
+    expect(def.currentVersion).toBe(1);
+    expect(def[BLUEPRINT].versions).toHaveLength(1);
+    expect(def[BLUEPRINT].indexes).toHaveLength(0);
   });
 
   // --------------------------------------------------------------------------
@@ -229,9 +177,6 @@ describe("collection builder", () => {
   // --------------------------------------------------------------------------
 
   it("multiple collections are independent", () => {
-    const { MockWasmBuilder } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
     const users = collection("users").v(1, { name: t.string() }).build();
     const posts = collection("posts").v(1, { title: t.string() }).build();
 
@@ -245,19 +190,16 @@ describe("collection builder", () => {
   // --------------------------------------------------------------------------
 
   it("passes full index options through", () => {
-    const { MockWasmBuilder, calls } = createMockBuilder();
-    const collection = createCollectionFactory(MockWasmBuilder as never);
-
-    collection("users")
+    const def = collection("users")
       .v(1, { email: t.string() })
       .index(["email"], { name: "email_idx", unique: true, sparse: true })
       .build();
 
-    const indexCalls = calls.filter((c) => c.method === "index");
-    expect(indexCalls[0].args[1]).toEqual({
-      name: "email_idx",
-      unique: true,
-      sparse: true,
+    const bp = def[BLUEPRINT];
+    expect(bp.indexes[0]).toEqual({
+      type: "field",
+      fields: ["email"],
+      options: { name: "email_idx", unique: true, sparse: true },
     });
   });
 });

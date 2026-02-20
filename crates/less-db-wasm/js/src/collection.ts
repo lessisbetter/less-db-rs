@@ -8,23 +8,8 @@
  *     .build();
  */
 
-import type { SchemaShape, CollectionDefHandle } from "./types.js";
-
-// ============================================================================
-// WASM types (internal)
-// ============================================================================
-
-/** @internal */
-export interface WasmCollectionBuilder {
-  new (name: string): WasmCollectionBuilder;
-  v1(schema: unknown): void;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  v(version: number, schema: unknown, migrate: (data: any) => any): void;
-  index(fields: string[], options: unknown): void;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  computed(name: string, compute: (data: any) => any, options: unknown): void;
-  build(): { readonly name: string; readonly currentVersion: number };
-}
+import type { SchemaShape, CollectionDefHandle, VersionEntry, IndexEntry } from "./types.js";
+import { BLUEPRINT } from "./types.js";
 
 // ============================================================================
 // Builder option types (exported for consumers)
@@ -78,30 +63,13 @@ export interface CollectionBuilderWithVersions<TName extends string, TSchema ext
 // Implementation
 // ============================================================================
 
-interface VersionEntry {
-  version: number;
-  schema: SchemaShape;
-  migrate?: (data: Record<string, unknown>) => Record<string, unknown>;
-}
-
-type AnyIndexEntry =
-  | { type: "field"; fields: string[]; options: IndexOptions }
-  | {
-      type: "computed";
-      name: string;
-      compute: (data: Record<string, unknown>) => string | number | boolean | null;
-      options: ComputedOptions;
-    };
-
 class CollectionBuilderNoVersionsImpl<TName extends string>
   implements CollectionBuilderNoVersions<TName>
 {
   #name: TName;
-  #wasmBuilderClass: new (name: string) => WasmCollectionBuilder;
 
-  constructor(name: TName, wasmBuilderClass: new (name: string) => WasmCollectionBuilder) {
+  constructor(name: TName) {
     this.#name = name;
-    this.#wasmBuilderClass = wasmBuilderClass;
   }
 
   v<S extends SchemaShape>(version: 1, schema: S): CollectionBuilderWithVersions<TName, S> {
@@ -110,7 +78,6 @@ class CollectionBuilderNoVersionsImpl<TName extends string>
       schema,
       [{ version: 1, schema }],
       [],
-      this.#wasmBuilderClass,
     );
   }
 }
@@ -121,34 +88,40 @@ class CollectionBuilderWithVersionsImpl<TName extends string, TSchema extends Sc
   #name: TName;
   #currentSchema: TSchema;
   #versions: VersionEntry[];
-  #indexes: AnyIndexEntry[];
-  #wasmBuilderClass: new (name: string) => WasmCollectionBuilder;
+  #indexes: IndexEntry[];
 
   constructor(
     name: TName,
     currentSchema: TSchema,
     versions: VersionEntry[],
-    indexes: AnyIndexEntry[],
-    wasmBuilderClass: new (name: string) => WasmCollectionBuilder,
+    indexes: IndexEntry[],
   ) {
     this.#name = name;
     this.#currentSchema = currentSchema;
     this.#versions = versions;
     this.#indexes = indexes;
-    this.#wasmBuilderClass = wasmBuilderClass;
   }
 
+  /**
+   * Add a new schema version with migration function.
+   * Indexes are reset — define all indexes after the final `.v()` call.
+   */
   v<S extends SchemaShape>(
     version: number,
     schema: S,
     migrate: (data: Record<string, unknown>) => Record<string, unknown>,
   ): CollectionBuilderWithVersions<TName, S> {
+    if (this.#indexes.length > 0) {
+      console.warn(
+        `[less-db] collection "${this.#name}": indexes defined before .v(${version}) will be dropped. ` +
+        `Define indexes after the last .v() call.`,
+      );
+    }
     return new CollectionBuilderWithVersionsImpl(
       this.#name,
       schema,
       [...this.#versions, { version, schema, migrate }],
       [],
-      this.#wasmBuilderClass,
     );
   }
 
@@ -167,31 +140,14 @@ class CollectionBuilderWithVersionsImpl<TName extends string, TSchema extends Sc
   }
 
   build(): CollectionDefHandle<TName, TSchema> {
-    const builder = new this.#wasmBuilderClass(this.#name);
-
-    for (const entry of this.#versions) {
-      if (entry.version === 1) {
-        builder.v1(entry.schema);
-      } else {
-        builder.v(entry.version, entry.schema, entry.migrate!);
-      }
-    }
-
-    for (const idx of this.#indexes) {
-      if (idx.type === "field") {
-        builder.index(idx.fields, idx.options);
-      } else {
-        builder.computed(idx.name, idx.compute as (data: unknown) => unknown, idx.options);
-      }
-    }
-
-    const wasmDef = builder.build();
-
     return {
       name: this.#name,
-      currentVersion: wasmDef.currentVersion,
+      currentVersion: Math.max(...this.#versions.map((v) => v.version)),
       schema: this.#currentSchema,
-      _wasm: wasmDef,
+      [BLUEPRINT]: {
+        versions: this.#versions,
+        indexes: this.#indexes,
+      },
     };
   }
 }
@@ -200,13 +156,9 @@ class CollectionBuilderWithVersionsImpl<TName extends string, TSchema extends Sc
 // Public API
 // ============================================================================
 
-/** Create a collection builder factory bound to a WASM module. */
-export function createCollectionFactory(
-  WasmBuilder: new (name: string) => WasmCollectionBuilder,
-): <TName extends string>(name: TName) => CollectionBuilderNoVersions<TName> {
-  return function collection<TName extends string>(
-    name: TName,
-  ): CollectionBuilderNoVersions<TName> {
-    return new CollectionBuilderNoVersionsImpl(name, WasmBuilder);
-  };
+/** Create a collection definition builder. */
+export function collection<TName extends string>(
+  name: TName,
+): CollectionBuilderNoVersions<TName> {
+  return new CollectionBuilderNoVersionsImpl(name);
 }

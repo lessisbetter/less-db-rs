@@ -2,8 +2,7 @@
  * LessDb — main database class wrapping the WASM core.
  *
  * Usage:
- *   const db = new LessDb(myStorageBackend);
- *   db.initialize([users, tasks]);
+ *   const db = await createDb("my-app", [users, tasks]);
  *   const record = db.put(users, { name: "Alice", email: "alice@example.com" });
  */
 
@@ -27,45 +26,50 @@ import type {
   ApplyRemoteOptions,
   PushSnapshot,
 } from "./types.js";
+import { BLUEPRINT } from "./types.js";
 import { serializeForRust, deserializeFromRust } from "./conversions.js";
-
-// WASM module interface — the actual types come from wasm-pack build
-interface WasmDb {
-  new (backend: StorageBackend): WasmDb;
-  initialize(defs: unknown[]): void;
-  put(collection: string, data: unknown, options: unknown): unknown;
-  get(collection: string, id: string, options: unknown): unknown;
-  patch(collection: string, data: unknown, options: unknown): unknown;
-  delete(collection: string, id: string, options: unknown): boolean;
-  query(collection: string, query: unknown): { records: unknown[]; total?: number };
-  count(collection: string, query: unknown): number;
-  getAll(collection: string, options: unknown): unknown[];
-  bulkPut(collection: string, records: unknown[], options: unknown): BatchResult<unknown>;
-  bulkDelete(collection: string, ids: string[], options: unknown): BulkDeleteResult;
-  observe(collection: string, id: string, callback: (data: unknown) => void): () => void;
-  observeQuery(collection: string, query: unknown, callback: (result: unknown) => void): () => void;
-  onChange(callback: (event: ChangeEvent) => void): () => void;
-  getDirty(collection: string): unknown[];
-  markSynced(collection: string, id: string, sequence: number, snapshot: unknown): void;
-  applyRemoteChanges(collection: string, records: unknown[], options: unknown): unknown;
-  getLastSequence(collection: string): number;
-  setLastSequence(collection: string, sequence: number): void;
-}
+import { ensureWasm } from "./wasm-init.js";
+import type { WasmDbInstance } from "./wasm-init.js";
 
 export class LessDb {
-  private _wasm: WasmDb;
-  private _schemas = new Map<string, SchemaShape>();
+  private _wasm: WasmDbInstance;
 
-  constructor(backend: StorageBackend, WasmDbClass: new (backend: StorageBackend) => WasmDb) {
-    this._wasm = new WasmDbClass(backend);
+  constructor(backend: StorageBackend) {
+    const { WasmDb } = ensureWasm();
+    this._wasm = new WasmDb(backend);
   }
 
   /** Initialize the database with collection definitions. */
   initialize(collections: CollectionDefHandle[]): void {
+    const { WasmCollectionBuilder } = ensureWasm();
+
+    const wasmDefs: unknown[] = [];
+
     for (const col of collections) {
-      this._schemas.set(col.name, col.schema);
+
+      const blueprint = col[BLUEPRINT];
+      const builder = new WasmCollectionBuilder(col.name);
+
+      for (const entry of blueprint.versions) {
+        if (entry.version === 1) {
+          builder.v1(entry.schema);
+        } else {
+          builder.v(entry.version, entry.schema, entry.migrate!);
+        }
+      }
+
+      for (const idx of blueprint.indexes) {
+        if (idx.type === "field") {
+          builder.index(idx.fields, idx.options);
+        } else {
+          builder.computed(idx.name, idx.compute as (data: unknown) => unknown, idx.options);
+        }
+      }
+
+      wasmDefs.push(builder.build());
     }
-    this._wasm.initialize(collections.map((c) => c._wasm));
+
+    this._wasm.initialize(wasmDefs);
   }
 
   // ========================================================================
@@ -234,7 +238,7 @@ export class LessDb {
 
   /** Register a global change listener. Returns an unsubscribe function. */
   onChange(callback: (event: ChangeEvent) => void): () => void {
-    return this._wasm.onChange(callback);
+    return this._wasm.onChange(callback as (event: unknown) => void);
   }
 
   // ========================================================================
@@ -264,8 +268,8 @@ export class LessDb {
     def: CollectionDefHandle<string, S>,
     records: RemoteRecord[],
     options?: ApplyRemoteOptions,
-  ): unknown {
-    return this._wasm.applyRemoteChanges(def.name, records, options ?? {});
+  ): void {
+    this._wasm.applyRemoteChanges(def.name, records, options ?? {});
   }
 
   /** Get the last sync sequence for a collection. */

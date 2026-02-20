@@ -2,25 +2,27 @@
  * less-db-wasm — WASM-powered local-first document store.
  *
  * Usage:
- *   import { init, t, LessDb } from "less-db-wasm";
- *
- *   const { collection, LessDb } = await init();
+ *   import { collection, t, createDb } from "less-db-wasm";
  *
  *   const users = collection("users")
  *     .v(1, { name: t.string(), email: t.string() })
  *     .index(["email"], { unique: true })
  *     .build();
  *
- *   const db = new LessDb(myBackend);
- *   db.initialize([users]);
- *
- *   const record = db.put(users, { name: "Alice", email: "alice@example.com" });
+ *   const db = await createDb("my-app", [users]);
+ *   const alice = db.put(users, { name: "Alice", email: "alice@example.com" });
  */
 
-import type { StorageBackend } from "./types.js";
+import type { CollectionDefHandle } from "./types.js";
+import { IndexedDbBackend } from "./IndexedDbBackend.js";
+import { initWasm as _initWasm } from "./wasm-init.js";
+import { LessDb } from "./LessDb.js";
 
 // Re-export schema builder
 export { t } from "./schema.js";
+
+// Re-export standalone collection builder
+export { collection } from "./collection.js";
 
 // Re-export types
 export type {
@@ -85,51 +87,43 @@ export type {
 export { serializeForRust, deserializeFromRust } from "./conversions.js";
 
 // Re-export IndexedDB backend
-export { IndexedDbBackend } from "./IndexedDbBackend.js";
+export { IndexedDbBackend };
 
 // Re-export LessDb class
-import { LessDb } from "./LessDb.js";
 export { LessDb };
 
-// Re-export collection factory
-import { createCollectionFactory } from "./collection.js";
-export { createCollectionFactory };
+// Re-export WASM init for advanced use
+export { initWasm, setWasmForTesting } from "./wasm-init.js";
+
+// Re-export builder option types
+export type { IndexOptions, ComputedOptions } from "./collection.js";
 
 /**
- * Initialize the WASM module and return the bound API.
+ * Create a database instance with IndexedDB storage and WASM engine.
  *
- * This binds the WASM classes to the TypeScript wrappers. Call once at app startup.
- *
- * @param wasmModule - The WASM module exports (from `import * as wasm from "../pkg/less_db_wasm"`)
+ * Opens IndexedDB and loads WASM in parallel, then initializes the database
+ * with the given collection definitions. One async call, done.
  *
  * @example
  * ```ts
- * import * as wasm from "../pkg/less_db_wasm";
- * import { createLessDb, t } from "less-db-wasm";
- *
- * const { collection, createDb } = createLessDb(wasm);
+ * import { collection, t, createDb } from "less-db-wasm";
  *
  * const users = collection("users")
  *   .v(1, { name: t.string(), email: t.string() })
  *   .build();
  *
- * const db = createDb(myBackend);
- * db.initialize([users]);
+ * const db = await createDb("my-app", [users]);
  * ```
  */
-export function createLessDb(wasmModule: {
-  WasmDb: new (backend: unknown) => unknown;
-  WasmCollectionBuilder: new (name: string) => unknown;
-}) {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const collection = createCollectionFactory(wasmModule.WasmCollectionBuilder as any);
-
-  return {
-    /** Collection definition builder. */
-    collection,
-    /** Create a new LessDb instance with a storage backend. */
-    createDb: (backend: StorageBackend) =>
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      new LessDb(backend, wasmModule.WasmDb as any),
-  };
+export async function createDb(
+  dbName: string,
+  collections: CollectionDefHandle[],
+): Promise<LessDb> {
+  const [backend] = await Promise.all([
+    IndexedDbBackend.open(dbName),
+    _initWasm(),
+  ]);
+  const db = new LessDb(backend);
+  db.initialize(collections);
+  return db;
 }

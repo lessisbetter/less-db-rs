@@ -1,14 +1,17 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { LessDb } from "./LessDb.js";
 import { t } from "./schema.js";
-import type { SchemaShape, CollectionDefHandle, StorageBackend } from "./types.js";
+import { setWasmForTesting } from "./wasm-init.js";
+import type { WasmModule } from "./wasm-init.js";
+import { BLUEPRINT } from "./types.js";
+import type { SchemaShape, CollectionDefHandle, StorageBackend, CollectionBlueprint } from "./types.js";
 
 // ============================================================================
-// Mock WasmDb
+// Mock WASM module
 // ============================================================================
 
-function createMockWasmDb() {
-  const mock = {
+function createMockWasm() {
+  const dbMock = {
     initialize: vi.fn(),
     put: vi.fn(),
     get: vi.fn(),
@@ -29,16 +32,37 @@ function createMockWasmDb() {
     setLastSequence: vi.fn(),
   };
 
-  let capturedBackend: unknown;
+  const builderCalls: Array<{ method: string; args: unknown[] }> = [];
 
-  class WasmDbClass {
-    constructor(backend: unknown) {
-      capturedBackend = backend;
-      Object.assign(this, mock);
+  class MockWasmCollectionBuilder {
+    name: string;
+    private _versionCount = 0;
+    constructor(name: string) {
+      this.name = name;
+      builderCalls.push({ method: "constructor", args: [name] });
+    }
+    v1(schema: unknown) { this._versionCount++; builderCalls.push({ method: "v1", args: [schema] }); }
+    v(version: number, schema: unknown, migrate: unknown) { this._versionCount++; builderCalls.push({ method: "v", args: [version, schema, migrate] }); }
+    index(fields: string[], options: unknown) { builderCalls.push({ method: "index", args: [fields, options] }); }
+    computed(name: string, compute: unknown, options: unknown) { builderCalls.push({ method: "computed", args: [name, compute, options] }); }
+    build() {
+      builderCalls.push({ method: "build", args: [] });
+      return { name: this.name, currentVersion: this._versionCount };
     }
   }
 
-  return { mock, WasmDbClass, get capturedBackend() { return capturedBackend; } };
+  class MockWasmDb {
+    constructor(_backend: unknown) {
+      Object.assign(this, dbMock);
+    }
+  }
+
+  const wasmModule = {
+    WasmDb: MockWasmDb,
+    WasmCollectionBuilder: MockWasmCollectionBuilder,
+  } as unknown as WasmModule;
+
+  return { dbMock, builderCalls, wasmModule };
 }
 
 // ============================================================================
@@ -48,12 +72,17 @@ function createMockWasmDb() {
 function makeCollectionDef<S extends SchemaShape>(
   name: string,
   schema: S,
+  blueprint?: Partial<CollectionBlueprint>,
 ): CollectionDefHandle<string, S> {
   return {
     name,
     currentVersion: 1,
     schema,
-    _wasm: { name, currentVersion: 1 },
+    [BLUEPRINT]: {
+      versions: [{ version: 1, schema }],
+      indexes: [],
+      ...blueprint,
+    },
   };
 }
 
@@ -64,16 +93,23 @@ const dummyBackend = {} as StorageBackend;
 // ============================================================================
 
 describe("LessDb", () => {
-  let mock: ReturnType<typeof createMockWasmDb>["mock"];
-  let WasmDbClass: ReturnType<typeof createMockWasmDb>["WasmDbClass"];
+  let dbMock: ReturnType<typeof createMockWasm>["dbMock"];
+  let builderCalls: ReturnType<typeof createMockWasm>["builderCalls"];
   let db: LessDb;
 
   const userSchema = { name: t.string(), email: t.string() };
   const usersDef = makeCollectionDef("users", userSchema);
 
   beforeEach(() => {
-    ({ mock, WasmDbClass } = createMockWasmDb());
-    db = new LessDb(dummyBackend, WasmDbClass as never);
+    const mock = createMockWasm();
+    dbMock = mock.dbMock;
+    builderCalls = mock.builderCalls;
+    setWasmForTesting(mock.wasmModule);
+    db = new LessDb(dummyBackend);
+  });
+
+  afterEach(() => {
+    setWasmForTesting(null);
   });
 
   // --------------------------------------------------------------------------
@@ -81,25 +117,36 @@ describe("LessDb", () => {
   // --------------------------------------------------------------------------
 
   describe("constructor + initialize", () => {
-    it("passes backend to WasmDb constructor", () => {
-      let captured: unknown;
-      class CapturingWasmDb {
-        constructor(backend: unknown) { captured = backend; }
-      }
-      const backend = { test: true } as unknown as StorageBackend;
-      new LessDb(backend, CapturingWasmDb as never);
-      expect(captured).toBe(backend);
+    it("throws if WASM is not initialized", () => {
+      setWasmForTesting(null);
+      expect(() => new LessDb(dummyBackend)).toThrow(/WASM module not initialized/);
     });
 
-    it("initialize passes _wasm handles to WASM", () => {
+    it("initialize materializes blueprints into WASM builder calls", () => {
       db.initialize([usersDef]);
-      expect(mock.initialize).toHaveBeenCalledWith([usersDef._wasm]);
+
+      expect(builderCalls[0]).toEqual({ method: "constructor", args: ["users"] });
+      expect(builderCalls[1]).toEqual({ method: "v1", args: [userSchema] });
+      expect(builderCalls[2]).toEqual({ method: "build", args: [] });
+      expect(dbMock.initialize).toHaveBeenCalledTimes(1);
+    });
+
+    it("initialize materializes indexes from blueprint", () => {
+      const def = makeCollectionDef("users", userSchema, {
+        indexes: [
+          { type: "field", fields: ["email"], options: { unique: true } },
+        ],
+      });
+      db.initialize([def]);
+
+      const indexCalls = builderCalls.filter((c) => c.method === "index");
+      expect(indexCalls).toHaveLength(1);
+      expect(indexCalls[0].args).toEqual([["email"], { unique: true }]);
     });
 
     it("initialize stores schemas for deserialization", () => {
-      // We'll verify this indirectly — put should deserialize using the schema
       db.initialize([usersDef]);
-      mock.put.mockReturnValue({
+      dbMock.put.mockReturnValue({
         id: "1",
         name: "Alice",
         email: "a@test.com",
@@ -120,7 +167,7 @@ describe("LessDb", () => {
       const dateDef = makeCollectionDef("events", { when: t.date() });
       db.initialize([dateDef]);
 
-      mock.put.mockReturnValue({
+      dbMock.put.mockReturnValue({
         id: "1",
         when: "2024-06-15T12:00:00.000Z",
         createdAt: "2024-06-15T12:00:00.000Z",
@@ -130,7 +177,7 @@ describe("LessDb", () => {
       const result = db.put(dateDef, { when: new Date("2024-06-15T12:00:00.000Z") } as never);
 
       // Input was serialized: Date → string
-      const sentData = mock.put.mock.calls[0][1];
+      const sentData = dbMock.put.mock.calls[0][1];
       expect(sentData.when).toBe("2024-06-15T12:00:00.000Z");
 
       // Output was deserialized: string → Date
@@ -139,21 +186,21 @@ describe("LessDb", () => {
 
     it("passes collection name to WASM", () => {
       db.initialize([usersDef]);
-      mock.put.mockReturnValue({ id: "1", name: "A", email: "a@t.com" });
+      dbMock.put.mockReturnValue({ id: "1", name: "A", email: "a@t.com" });
 
       db.put(usersDef, { name: "A", email: "a@t.com" } as never);
-      expect(mock.put.mock.calls[0][0]).toBe("users");
+      expect(dbMock.put.mock.calls[0][0]).toBe("users");
     });
 
     it("passes options or null", () => {
       db.initialize([usersDef]);
-      mock.put.mockReturnValue({ id: "1", name: "A", email: "a@t.com" });
+      dbMock.put.mockReturnValue({ id: "1", name: "A", email: "a@t.com" });
 
       db.put(usersDef, { name: "A", email: "a@t.com" } as never);
-      expect(mock.put.mock.calls[0][2]).toBeNull();
+      expect(dbMock.put.mock.calls[0][2]).toBeNull();
 
       db.put(usersDef, { name: "B", email: "b@t.com" } as never, { id: "custom" });
-      expect(mock.put.mock.calls[1][2]).toEqual({ id: "custom" });
+      expect(dbMock.put.mock.calls[1][2]).toEqual({ id: "custom" });
     });
   });
 
@@ -166,7 +213,7 @@ describe("LessDb", () => {
       const dateDef = makeCollectionDef("events", { when: t.date() });
       db.initialize([dateDef]);
 
-      mock.get.mockReturnValue({
+      dbMock.get.mockReturnValue({
         id: "1",
         when: "2024-01-01T00:00:00.000Z",
         createdAt: "2024-01-01T00:00:00.000Z",
@@ -180,7 +227,7 @@ describe("LessDb", () => {
 
     it("returns null when WASM returns null", () => {
       db.initialize([usersDef]);
-      mock.get.mockReturnValue(null);
+      dbMock.get.mockReturnValue(null);
 
       const result = db.get(usersDef, "nonexistent");
       expect(result).toBeNull();
@@ -188,18 +235,18 @@ describe("LessDb", () => {
 
     it("passes collection, id, and options", () => {
       db.initialize([usersDef]);
-      mock.get.mockReturnValue(null);
+      dbMock.get.mockReturnValue(null);
 
       db.get(usersDef, "42", { includeDeleted: true });
-      expect(mock.get).toHaveBeenCalledWith("users", "42", { includeDeleted: true });
+      expect(dbMock.get).toHaveBeenCalledWith("users", "42", { includeDeleted: true });
     });
 
     it("passes null when no options", () => {
       db.initialize([usersDef]);
-      mock.get.mockReturnValue(null);
+      dbMock.get.mockReturnValue(null);
 
       db.get(usersDef, "42");
-      expect(mock.get.mock.calls[0][2]).toBeNull();
+      expect(dbMock.get.mock.calls[0][2]).toBeNull();
     });
   });
 
@@ -210,7 +257,7 @@ describe("LessDb", () => {
   describe("patch", () => {
     it("splits id from data and passes it in options", () => {
       db.initialize([usersDef]);
-      mock.patch.mockReturnValue({
+      dbMock.patch.mockReturnValue({
         id: "1",
         name: "Bob",
         email: "b@t.com",
@@ -218,7 +265,7 @@ describe("LessDb", () => {
 
       db.patch(usersDef, { id: "1", name: "Bob" } as never);
 
-      const [collection, data, options] = mock.patch.mock.calls[0];
+      const [collection, data, options] = dbMock.patch.mock.calls[0];
       expect(collection).toBe("users");
       expect(data).toEqual({ name: "Bob" });
       expect(options.id).toBe("1");
@@ -228,14 +275,14 @@ describe("LessDb", () => {
       const dateDef = makeCollectionDef("events", { when: t.date() });
       db.initialize([dateDef]);
 
-      mock.patch.mockReturnValue({
+      dbMock.patch.mockReturnValue({
         id: "1",
         when: "2024-06-15T12:00:00.000Z",
       });
 
       db.patch(dateDef, { id: "1", when: new Date("2024-06-15T12:00:00.000Z") } as never);
 
-      const sentData = mock.patch.mock.calls[0][1];
+      const sentData = dbMock.patch.mock.calls[0][1];
       expect(sentData.when).toBe("2024-06-15T12:00:00.000Z");
     });
 
@@ -243,7 +290,7 @@ describe("LessDb", () => {
       const dateDef = makeCollectionDef("events", { when: t.date() });
       db.initialize([dateDef]);
 
-      mock.patch.mockReturnValue({
+      dbMock.patch.mockReturnValue({
         id: "1",
         when: "2024-06-15T12:00:00.000Z",
         createdAt: "2024-01-01T00:00:00.000Z",
@@ -263,27 +310,27 @@ describe("LessDb", () => {
   describe("delete", () => {
     it("returns boolean directly from WASM", () => {
       db.initialize([usersDef]);
-      mock.delete.mockReturnValue(true);
+      dbMock.delete.mockReturnValue(true);
       expect(db.delete(usersDef, "1")).toBe(true);
 
-      mock.delete.mockReturnValue(false);
+      dbMock.delete.mockReturnValue(false);
       expect(db.delete(usersDef, "2")).toBe(false);
     });
 
     it("passes collection, id, and options", () => {
       db.initialize([usersDef]);
-      mock.delete.mockReturnValue(true);
+      dbMock.delete.mockReturnValue(true);
 
       db.delete(usersDef, "1", { sessionId: 5 });
-      expect(mock.delete).toHaveBeenCalledWith("users", "1", { sessionId: 5 });
+      expect(dbMock.delete).toHaveBeenCalledWith("users", "1", { sessionId: 5 });
     });
 
     it("passes null when no options", () => {
       db.initialize([usersDef]);
-      mock.delete.mockReturnValue(true);
+      dbMock.delete.mockReturnValue(true);
 
       db.delete(usersDef, "1");
-      expect(mock.delete.mock.calls[0][2]).toBeNull();
+      expect(dbMock.delete.mock.calls[0][2]).toBeNull();
     });
   });
 
@@ -296,7 +343,7 @@ describe("LessDb", () => {
       const dateDef = makeCollectionDef("events", { when: t.date() });
       db.initialize([dateDef]);
 
-      mock.query.mockReturnValue({
+      dbMock.query.mockReturnValue({
         records: [
           { id: "1", when: "2024-01-01T00:00:00.000Z", createdAt: "2024-01-01T00:00:00.000Z", updatedAt: "2024-01-01T00:00:00.000Z" },
         ],
@@ -311,25 +358,25 @@ describe("LessDb", () => {
 
     it("serializes filter", () => {
       db.initialize([usersDef]);
-      mock.query.mockReturnValue({ records: [] });
+      dbMock.query.mockReturnValue({ records: [] });
 
       db.query(usersDef, {
         filter: { since: new Date("2024-01-01T00:00:00.000Z") },
         limit: 10,
       });
 
-      const sentQuery = mock.query.mock.calls[0][1];
+      const sentQuery = dbMock.query.mock.calls[0][1];
       expect(sentQuery.filter.since).toBe("2024-01-01T00:00:00.000Z");
       expect(sentQuery.limit).toBe(10);
     });
 
     it("passes undefined filter when no filter provided", () => {
       db.initialize([usersDef]);
-      mock.query.mockReturnValue({ records: [] });
+      dbMock.query.mockReturnValue({ records: [] });
 
       db.query(usersDef, { limit: 5 });
 
-      const sentQuery = mock.query.mock.calls[0][1];
+      const sentQuery = dbMock.query.mock.calls[0][1];
       expect(sentQuery.filter).toBeUndefined();
     });
   });
@@ -341,25 +388,25 @@ describe("LessDb", () => {
   describe("count", () => {
     it("returns number from WASM", () => {
       db.initialize([usersDef]);
-      mock.count.mockReturnValue(42);
+      dbMock.count.mockReturnValue(42);
 
       expect(db.count(usersDef)).toBe(42);
     });
 
     it("passes null when no query", () => {
       db.initialize([usersDef]);
-      mock.count.mockReturnValue(0);
+      dbMock.count.mockReturnValue(0);
 
       db.count(usersDef);
-      expect(mock.count).toHaveBeenCalledWith("users", null);
+      expect(dbMock.count).toHaveBeenCalledWith("users", null);
     });
 
     it("serializes filter in query", () => {
       db.initialize([usersDef]);
-      mock.count.mockReturnValue(5);
+      dbMock.count.mockReturnValue(5);
 
       db.count(usersDef, { filter: { active: true } });
-      const sentQuery = mock.count.mock.calls[0][1];
+      const sentQuery = dbMock.count.mock.calls[0][1];
       expect(sentQuery.filter).toEqual({ active: true });
     });
   });
@@ -373,7 +420,7 @@ describe("LessDb", () => {
       const dateDef = makeCollectionDef("events", { when: t.date() });
       db.initialize([dateDef]);
 
-      mock.getAll.mockReturnValue([
+      dbMock.getAll.mockReturnValue([
         { id: "1", when: "2024-01-01T00:00:00.000Z", createdAt: "2024-01-01T00:00:00.000Z", updatedAt: "2024-01-01T00:00:00.000Z" },
         { id: "2", when: "2024-06-01T00:00:00.000Z", createdAt: "2024-06-01T00:00:00.000Z", updatedAt: "2024-06-01T00:00:00.000Z" },
       ]);
@@ -386,13 +433,13 @@ describe("LessDb", () => {
 
     it("passes options or null", () => {
       db.initialize([usersDef]);
-      mock.getAll.mockReturnValue([]);
+      dbMock.getAll.mockReturnValue([]);
 
       db.getAll(usersDef);
-      expect(mock.getAll.mock.calls[0][1]).toBeNull();
+      expect(dbMock.getAll.mock.calls[0][1]).toBeNull();
 
       db.getAll(usersDef, { limit: 10 });
-      expect(mock.getAll.mock.calls[1][1]).toEqual({ limit: 10 });
+      expect(dbMock.getAll.mock.calls[1][1]).toEqual({ limit: 10 });
     });
   });
 
@@ -405,7 +452,7 @@ describe("LessDb", () => {
       const dateDef = makeCollectionDef("events", { when: t.date() });
       db.initialize([dateDef]);
 
-      mock.bulkPut.mockReturnValue({
+      dbMock.bulkPut.mockReturnValue({
         records: [
           { id: "1", when: "2024-01-01T00:00:00.000Z", createdAt: "2024-01-01T00:00:00.000Z", updatedAt: "2024-01-01T00:00:00.000Z" },
         ],
@@ -417,7 +464,7 @@ describe("LessDb", () => {
       ] as never);
 
       // Input serialized
-      const sentRecords = mock.bulkPut.mock.calls[0][1];
+      const sentRecords = dbMock.bulkPut.mock.calls[0][1];
       expect(sentRecords[0].when).toBe("2024-01-01T00:00:00.000Z");
 
       // Output deserialized
@@ -429,7 +476,7 @@ describe("LessDb", () => {
       db.initialize([usersDef]);
 
       const errors = [{ id: "1", collection: "users", error: "unique violation" }];
-      mock.bulkPut.mockReturnValue({ records: [], errors });
+      dbMock.bulkPut.mockReturnValue({ records: [], errors });
 
       const result = db.bulkPut(usersDef, [] as never);
       expect(result.errors).toBe(errors);
@@ -444,11 +491,11 @@ describe("LessDb", () => {
     it("passes through to WASM", () => {
       db.initialize([usersDef]);
       const wasmResult = { deleted_ids: ["1", "2"], errors: [] };
-      mock.bulkDelete.mockReturnValue(wasmResult);
+      dbMock.bulkDelete.mockReturnValue(wasmResult);
 
       const result = db.bulkDelete(usersDef, ["1", "2"]);
       expect(result).toBe(wasmResult);
-      expect(mock.bulkDelete).toHaveBeenCalledWith("users", ["1", "2"], null);
+      expect(dbMock.bulkDelete).toHaveBeenCalledWith("users", ["1", "2"], null);
     });
   });
 
@@ -463,7 +510,7 @@ describe("LessDb", () => {
 
       let capturedCallback: ((data: unknown) => void) | null = null;
       const unsub = vi.fn();
-      mock.observe.mockImplementation((_col: string, _id: string, cb: (data: unknown) => void) => {
+      dbMock.observe.mockImplementation((_col: string, _id: string, cb: (data: unknown) => void) => {
         capturedCallback = cb;
         return unsub;
       });
@@ -471,7 +518,6 @@ describe("LessDb", () => {
       const received: unknown[] = [];
       const returnedUnsub = db.observe(dateDef, "1", (data) => received.push(data));
 
-      // Simulate WASM calling back with raw data
       capturedCallback!({
         id: "1",
         when: "2024-01-01T00:00:00.000Z",
@@ -488,7 +534,7 @@ describe("LessDb", () => {
       db.initialize([usersDef]);
 
       let capturedCallback: ((data: unknown) => void) | null = null;
-      mock.observe.mockImplementation((_col: string, _id: string, cb: (data: unknown) => void) => {
+      dbMock.observe.mockImplementation((_col: string, _id: string, cb: (data: unknown) => void) => {
         capturedCallback = cb;
         return vi.fn();
       });
@@ -504,7 +550,7 @@ describe("LessDb", () => {
       db.initialize([usersDef]);
 
       let capturedCallback: ((data: unknown) => void) | null = null;
-      mock.observe.mockImplementation((_col: string, _id: string, cb: (data: unknown) => void) => {
+      dbMock.observe.mockImplementation((_col: string, _id: string, cb: (data: unknown) => void) => {
         capturedCallback = cb;
         return vi.fn();
       });
@@ -527,7 +573,7 @@ describe("LessDb", () => {
       db.initialize([dateDef]);
 
       let capturedCallback: ((result: unknown) => void) | null = null;
-      mock.observeQuery.mockImplementation((_col: string, _query: unknown, cb: (result: unknown) => void) => {
+      dbMock.observeQuery.mockImplementation((_col: string, _query: unknown, cb: (result: unknown) => void) => {
         capturedCallback = cb;
         return vi.fn();
       });
@@ -540,7 +586,7 @@ describe("LessDb", () => {
       );
 
       // Check filter was serialized
-      const sentQuery = mock.observeQuery.mock.calls[0][1];
+      const sentQuery = dbMock.observeQuery.mock.calls[0][1];
       expect(sentQuery.filter.after).toBe("2024-01-01T00:00:00.000Z");
 
       // Simulate callback
@@ -565,12 +611,12 @@ describe("LessDb", () => {
   describe("onChange", () => {
     it("passes callback through to WASM", () => {
       const unsub = vi.fn();
-      mock.onChange.mockReturnValue(unsub);
+      dbMock.onChange.mockReturnValue(unsub);
 
       const cb = vi.fn();
       const returnedUnsub = db.onChange(cb);
 
-      expect(mock.onChange).toHaveBeenCalledWith(cb);
+      expect(dbMock.onChange).toHaveBeenCalledWith(cb);
       expect(returnedUnsub).toBe(unsub);
     });
   });
@@ -584,7 +630,7 @@ describe("LessDb", () => {
       const dateDef = makeCollectionDef("events", { when: t.date() });
       db.initialize([dateDef]);
 
-      mock.getDirty.mockReturnValue([
+      dbMock.getDirty.mockReturnValue([
         { id: "1", when: "2024-01-01T00:00:00.000Z", createdAt: "2024-01-01T00:00:00.000Z", updatedAt: "2024-01-01T00:00:00.000Z" },
       ]);
 
@@ -596,36 +642,36 @@ describe("LessDb", () => {
     it("markSynced passes null when no snapshot", () => {
       db.initialize([usersDef]);
       db.markSynced(usersDef, "1", 5);
-      expect(mock.markSynced).toHaveBeenCalledWith("users", "1", 5, null);
+      expect(dbMock.markSynced).toHaveBeenCalledWith("users", "1", 5, null);
     });
 
     it("markSynced passes snapshot when provided", () => {
       db.initialize([usersDef]);
       const snapshot = { pending_patches_length: 0, deleted: false };
       db.markSynced(usersDef, "1", 5, snapshot);
-      expect(mock.markSynced).toHaveBeenCalledWith("users", "1", 5, snapshot);
+      expect(dbMock.markSynced).toHaveBeenCalledWith("users", "1", 5, snapshot);
     });
 
     it("applyRemoteChanges passes options or empty object", () => {
       db.initialize([usersDef]);
-      mock.applyRemoteChanges.mockReturnValue(undefined);
+      dbMock.applyRemoteChanges.mockReturnValue(undefined);
 
       db.applyRemoteChanges(usersDef, []);
-      expect(mock.applyRemoteChanges.mock.calls[0][2]).toEqual({});
+      expect(dbMock.applyRemoteChanges.mock.calls[0][2]).toEqual({});
 
       db.applyRemoteChanges(usersDef, [], { delete_conflict_strategy: "RemoteWins" });
-      expect(mock.applyRemoteChanges.mock.calls[1][2]).toEqual({
+      expect(dbMock.applyRemoteChanges.mock.calls[1][2]).toEqual({
         delete_conflict_strategy: "RemoteWins",
       });
     });
 
     it("getLastSequence / setLastSequence pass through", () => {
-      mock.getLastSequence.mockReturnValue(99);
+      dbMock.getLastSequence.mockReturnValue(99);
       expect(db.getLastSequence("users")).toBe(99);
-      expect(mock.getLastSequence).toHaveBeenCalledWith("users");
+      expect(dbMock.getLastSequence).toHaveBeenCalledWith("users");
 
       db.setLastSequence("users", 100);
-      expect(mock.setLastSequence).toHaveBeenCalledWith("users", 100);
+      expect(dbMock.setLastSequence).toHaveBeenCalledWith("users", 100);
     });
   });
 });

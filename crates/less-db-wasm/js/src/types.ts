@@ -266,6 +266,32 @@ export type ChangeEvent =
 // Collection definition (opaque handle)
 // ============================================================================
 
+/** @internal Symbol key for the collection blueprint data. */
+export const BLUEPRINT = Symbol("blueprint");
+
+/** @internal Version entry captured during collection building. */
+export interface VersionEntry {
+  version: number;
+  schema: SchemaShape;
+  migrate?: (data: Record<string, unknown>) => Record<string, unknown>;
+}
+
+/** @internal Index entry captured during collection building. */
+export type IndexEntry =
+  | { type: "field"; fields: string[]; options: { name?: string; unique?: boolean; sparse?: boolean } }
+  | {
+      type: "computed";
+      name: string;
+      compute: (data: Record<string, unknown>) => string | number | boolean | null;
+      options: { unique?: boolean; sparse?: boolean };
+    };
+
+/** @internal Pure data captured by the collection builder, materialized into WASM at initialize(). */
+export interface CollectionBlueprint {
+  versions: VersionEntry[];
+  indexes: IndexEntry[];
+}
+
 export interface CollectionDefHandle<
   TName extends string = string,
   TSchema extends SchemaShape = SchemaShape,
@@ -274,8 +300,8 @@ export interface CollectionDefHandle<
   readonly currentVersion: number;
   /** The schema shape, stored for type inference and deserialization. */
   readonly schema: TSchema;
-  /** Internal WASM handle — do not use directly. */
-  readonly _wasm: unknown;
+  /** @internal Pure data blueprint — materialized into WASM at db.initialize(). */
+  readonly [BLUEPRINT]: CollectionBlueprint;
 }
 
 // ============================================================================
