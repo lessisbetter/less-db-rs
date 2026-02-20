@@ -21,7 +21,7 @@ use super::traits::StorageBackend;
 // ============================================================================
 
 /// A pending persistence operation to be flushed to the inner backend.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum PersistOp {
     PutRecord(Box<SerializedRecord>),
     PurgeTombstones {
@@ -38,8 +38,8 @@ pub enum PersistOp {
 // MemoryMapped
 // ============================================================================
 
-/// Transaction buffer type for records.
-type TxRecordBuffer = HashMap<String, HashMap<String, Option<SerializedRecord>>>;
+/// Transaction buffer type for records: collection → (id → record).
+type TxRecordBuffer = HashMap<String, HashMap<String, SerializedRecord>>;
 
 /// In-memory storage wrapper that reads from HashMaps and batches writes.
 ///
@@ -48,6 +48,17 @@ type TxRecordBuffer = HashMap<String, HashMap<String, Option<SerializedRecord>>>
 ///
 /// Interior mutability via `parking_lot::Mutex` (Send + Sync on all targets).
 /// Uncontended locks are near-zero overhead on single-threaded WASM.
+///
+/// ## Lock ordering
+///
+/// When multiple locks are needed, they must be acquired in this order to
+/// prevent deadlocks:
+///
+/// 1. `tx_records` / `tx_meta` (transaction buffers)
+/// 2. `records` / `meta` (main store)
+/// 3. `pending_ops` (persistence queue)
+///
+/// No method acquires a lock that precedes an already-held lock in this order.
 pub struct MemoryMapped<B: StorageBackend> {
     inner: B,
     /// collection name → (record id → record)
@@ -56,10 +67,10 @@ pub struct MemoryMapped<B: StorageBackend> {
     meta: Mutex<HashMap<String, String>>,
     /// Pending ops to flush to inner backend
     pending_ops: Mutex<Vec<PersistOp>>,
-    /// Transaction buffer for records: collection → (id → Option<record>), None = delete
+    /// Transaction buffer for records: collection → (id → record)
     tx_records: Mutex<Option<TxRecordBuffer>>,
-    /// Transaction buffer for metadata: key → Option<value>, None = delete
-    tx_meta: Mutex<Option<HashMap<String, Option<String>>>>,
+    /// Transaction buffer for metadata: key → value
+    tx_meta: Mutex<Option<HashMap<String, String>>>,
 }
 
 impl<B: StorageBackend> MemoryMapped<B> {
@@ -97,59 +108,64 @@ impl<B: StorageBackend> MemoryMapped<B> {
     }
 
     /// Flush all pending operations to the inner backend.
-    /// On error, unprocessed ops are pushed back for retry.
+    /// On error, unflushed ops (including any batched PutRecords) are pushed
+    /// back for retry.
     pub fn flush(&self) -> Result<()> {
         let ops: Vec<PersistOp> = self.pending_ops.lock().drain(..).collect();
         if ops.is_empty() {
             return Ok(());
         }
 
-        // Process ops one at a time, tracking progress for error recovery.
-        // Consecutive PutRecord ops are batched for efficiency.
+        // Process ops, batching consecutive PutRecords for efficiency.
+        // On error, we reconstruct remaining ops from both the unflushed
+        // records_to_put buffer and any unprocessed ops.
         let mut records_to_put: Vec<SerializedRecord> = Vec::new();
         let mut processed = 0;
-
-        let flush_puts = |records: &mut Vec<SerializedRecord>, inner: &B| -> Result<()> {
-            if !records.is_empty() {
-                inner.batch_put_raw(records)?;
-                records.clear();
-            }
-            Ok(())
-        };
 
         let result = (|| -> Result<()> {
             for (i, op) in ops.iter().enumerate() {
                 match op {
                     PersistOp::PutRecord(record) => {
-                        records_to_put.push(*record.clone());
+                        records_to_put.push((**record).clone());
                     }
                     PersistOp::PurgeTombstones {
                         collection,
                         options,
                     } => {
-                        flush_puts(&mut records_to_put, &self.inner)?;
+                        if !records_to_put.is_empty() {
+                            self.inner.batch_put_raw(&records_to_put)?;
+                            records_to_put.clear();
+                        }
                         self.inner.purge_tombstones_raw(collection, options)?;
                     }
                     PersistOp::SetMeta { key, value } => {
-                        flush_puts(&mut records_to_put, &self.inner)?;
+                        if !records_to_put.is_empty() {
+                            self.inner.batch_put_raw(&records_to_put)?;
+                            records_to_put.clear();
+                        }
                         self.inner.set_meta(key, value)?;
                     }
                 }
                 processed = i + 1;
             }
-            flush_puts(&mut records_to_put, &self.inner)
+            if !records_to_put.is_empty() {
+                self.inner.batch_put_raw(&records_to_put)?;
+                records_to_put.clear();
+            }
+            Ok(())
         })();
 
         if let Err(e) = result {
-            // Push unprocessed ops back for retry
-            let remaining: Vec<PersistOp> = ops.into_iter().skip(processed).collect();
+            // Re-enqueue: unflushed put-batch first, then remaining unprocessed ops
+            let mut remaining: Vec<PersistOp> = records_to_put
+                .into_iter()
+                .map(|r| PersistOp::PutRecord(Box::new(r)))
+                .collect();
+            remaining.extend(ops.into_iter().skip(processed));
+
             if !remaining.is_empty() {
                 let mut pending = self.pending_ops.lock();
-                // Prepend remaining before any new ops enqueued since drain
-                remaining
-                    .into_iter()
-                    .rev()
-                    .for_each(|op| pending.insert(0, op));
+                pending.splice(0..0, remaining);
             }
             return Err(e);
         }
@@ -195,8 +211,8 @@ impl<B: StorageBackend> MemoryMapped<B> {
         let tx = self.tx_records.lock();
         if let Some(ref tx_map) = *tx {
             if let Some(col_buf) = tx_map.get(collection) {
-                if let Some(entry) = col_buf.get(id) {
-                    return entry.clone(); // None = deleted in tx
+                if let Some(record) = col_buf.get(id) {
+                    return Some(record.clone());
                 }
             }
         }
@@ -208,7 +224,7 @@ impl<B: StorageBackend> MemoryMapped<B> {
     }
 
     /// Iterate records in a collection, merging tx buffer with main store.
-    /// Returns a collected Vec to avoid holding borrows across operations.
+    /// Returns a collected Vec to avoid holding locks across operations.
     fn iter_collection(&self, collection: &str) -> Vec<SerializedRecord> {
         let tx = self.tx_records.lock();
         let tx_col = tx.as_ref().and_then(|m| m.get(collection));
@@ -228,12 +244,200 @@ impl<B: StorageBackend> MemoryMapped<B> {
         }
 
         if let Some(tx_map) = tx_col {
-            for record in tx_map.values().flatten() {
+            for record in tx_map.values() {
                 results.push(record.clone());
             }
         }
 
         results
+    }
+
+    /// Count non-deleted records in-place without cloning.
+    fn count_collection(&self, collection: &str) -> usize {
+        let tx = self.tx_records.lock();
+        let tx_col = tx.as_ref().and_then(|m| m.get(collection));
+        let records = self.records.lock();
+
+        let mut count = 0;
+
+        if let Some(main_col) = records.get(collection) {
+            for (id, record) in main_col {
+                if let Some(tx_map) = tx_col {
+                    if tx_map.contains_key(id) {
+                        continue;
+                    }
+                }
+                if !record.deleted {
+                    count += 1;
+                }
+            }
+        }
+
+        if let Some(tx_map) = tx_col {
+            for record in tx_map.values() {
+                if !record.deleted {
+                    count += 1;
+                }
+            }
+        }
+
+        count
+    }
+
+    /// Check a field index uniqueness constraint in-place without cloning records.
+    fn check_field_unique(
+        &self,
+        collection: &str,
+        fi: &crate::index::types::FieldIndex,
+        new_values: &[Option<&Value>],
+        exclude_id: Option<&str>,
+    ) -> Result<()> {
+        let tx = self.tx_records.lock();
+        let tx_col = tx.as_ref().and_then(|m| m.get(collection));
+        let records = self.records.lock();
+
+        // Check a single record against the new values
+        let check_record = |record: &SerializedRecord| -> Option<String> {
+            if record.deleted {
+                return None;
+            }
+            if exclude_id == Some(record.id.as_str()) {
+                return None;
+            }
+            let rec_obj = record.data.as_object();
+            let matches = fi.fields.iter().enumerate().all(|(i, f)| {
+                let existing = rec_obj.and_then(|o| o.get(&f.field));
+                match (existing, new_values[i]) {
+                    (None, None) | (Some(Value::Null), None) | (None, Some(Value::Null)) => true,
+                    (Some(a), Some(b)) => a == b,
+                    _ => false,
+                }
+            });
+            if matches {
+                Some(record.id.clone())
+            } else {
+                None
+            }
+        };
+
+        // Check main store (excluding tx-overridden records)
+        if let Some(main_col) = records.get(collection) {
+            for (id, record) in main_col {
+                if tx_col.is_some_and(|tx| tx.contains_key(id)) {
+                    continue;
+                }
+                if let Some(existing_id) = check_record(record) {
+                    return Err(self.unique_error(collection, &fi.name, &existing_id, new_values));
+                }
+            }
+        }
+
+        // Check tx buffer
+        if let Some(tx_map) = tx_col {
+            for record in tx_map.values() {
+                if let Some(existing_id) = check_record(record) {
+                    return Err(self.unique_error(collection, &fi.name, &existing_id, new_values));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check a computed index uniqueness constraint in-place without cloning records.
+    fn check_computed_unique(
+        &self,
+        collection: &str,
+        ci: &crate::index::types::ComputedIndex,
+        field_val: Option<&Value>,
+        exclude_id: Option<&str>,
+    ) -> Result<()> {
+        let tx = self.tx_records.lock();
+        let tx_col = tx.as_ref().and_then(|m| m.get(collection));
+        let records = self.records.lock();
+
+        let check_record = |record: &SerializedRecord| -> Option<String> {
+            if record.deleted {
+                return None;
+            }
+            if exclude_id == Some(record.id.as_str()) {
+                return None;
+            }
+            let rec_computed = record.computed.as_ref();
+            let existing = rec_computed.and_then(|c| c.get(&ci.name));
+            let matches = match (existing, field_val) {
+                (None, None) | (Some(Value::Null), None) | (None, Some(Value::Null)) => true,
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            if matches {
+                Some(record.id.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(main_col) = records.get(collection) {
+            for (id, record) in main_col {
+                if tx_col.is_some_and(|tx| tx.contains_key(id)) {
+                    continue;
+                }
+                if let Some(existing_id) = check_record(record) {
+                    let conflict_value = field_val.cloned().unwrap_or(Value::Null);
+                    return Err(StorageError::UniqueConstraint {
+                        collection: collection.to_string(),
+                        index: ci.name.clone(),
+                        existing_id,
+                        value: conflict_value,
+                    }
+                    .into());
+                }
+            }
+        }
+
+        if let Some(tx_map) = tx_col {
+            for record in tx_map.values() {
+                if let Some(existing_id) = check_record(record) {
+                    let conflict_value = field_val.cloned().unwrap_or(Value::Null);
+                    return Err(StorageError::UniqueConstraint {
+                        collection: collection.to_string(),
+                        index: ci.name.clone(),
+                        existing_id,
+                        value: conflict_value,
+                    }
+                    .into());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Build a UniqueConstraint error for field indexes.
+    fn unique_error(
+        &self,
+        collection: &str,
+        index_name: &str,
+        existing_id: &str,
+        new_values: &[Option<&Value>],
+    ) -> crate::error::LessDbError {
+        let conflict_value = if new_values.len() == 1 {
+            new_values[0].cloned().unwrap_or(Value::Null)
+        } else {
+            Value::Array(
+                new_values
+                    .iter()
+                    .map(|v| v.cloned().unwrap_or(Value::Null))
+                    .collect(),
+            )
+        };
+        StorageError::UniqueConstraint {
+            collection: collection.to_string(),
+            index: index_name.to_string(),
+            existing_id: existing_id.to_string(),
+            value: conflict_value,
+        }
+        .into()
     }
 }
 
@@ -252,7 +456,7 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
             tx_map
                 .entry(record.collection.clone())
                 .or_default()
-                .insert(record.id.clone(), Some(record.clone()));
+                .insert(record.id.clone(), record.clone());
         } else {
             drop(tx);
             self.put_in_memory(record.clone());
@@ -299,8 +503,7 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
     }
 
     fn count_raw(&self, collection: &str) -> Result<usize> {
-        let all = self.iter_collection(collection);
-        Ok(all.iter().filter(|r| !r.deleted).count())
+        Ok(self.count_collection(collection))
     }
 
     fn batch_put_raw(&self, records: &[SerializedRecord]) -> Result<()> {
@@ -355,6 +558,10 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
                     col_map.remove(id);
                 }
             }
+            // Forward the original options so the inner backend applies its own
+            // time-based filtering. This may purge slightly more records than memory
+            // did (if time passed since we checked), which is safe — memory already
+            // removed its subset, and the inner backend removes its own.
             self.enqueue(PersistOp::PurgeTombstones {
                 collection: collection.to_string(),
                 options: options.clone(),
@@ -367,8 +574,8 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
     fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let tx = self.tx_meta.lock();
         if let Some(ref tx_map) = *tx {
-            if let Some(entry) = tx_map.get(key) {
-                return Ok(entry.clone()); // None = deleted in tx
+            if let Some(value) = tx_map.get(key) {
+                return Ok(Some(value.clone()));
             }
         }
         Ok(self.meta.lock().get(key).cloned())
@@ -377,7 +584,7 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
     fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         let mut tx = self.tx_meta.lock();
         if let Some(ref mut tx_map) = *tx {
-            tx_map.insert(key.to_string(), Some(value.to_string()));
+            tx_map.insert(key.to_string(), value.to_string());
         } else {
             drop(tx);
             self.meta.lock().insert(key.to_string(), value.to_string());
@@ -416,38 +623,22 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
 
                 if let Some(record_map) = record_buf {
                     let mut records = self.records.lock();
-                    for (col, col_buf) in record_map {
-                        for (id, entry) in col_buf {
-                            match entry {
-                                Some(record) => {
-                                    records
-                                        .entry(record.collection.clone())
-                                        .or_default()
-                                        .insert(record.id.clone(), record.clone());
-                                    self.enqueue(PersistOp::PutRecord(Box::new(record)));
-                                }
-                                None => {
-                                    if let Some(col_map) = records.get_mut(&col) {
-                                        col_map.remove(&id);
-                                    }
-                                }
-                            }
+                    for (_col, col_buf) in record_map {
+                        for (_id, record) in col_buf {
+                            records
+                                .entry(record.collection.clone())
+                                .or_default()
+                                .insert(record.id.clone(), record.clone());
+                            self.enqueue(PersistOp::PutRecord(Box::new(record)));
                         }
                     }
                 }
 
                 if let Some(meta_map) = meta_buf {
                     let mut meta = self.meta.lock();
-                    for (key, entry) in meta_map {
-                        match entry {
-                            Some(value) => {
-                                meta.insert(key.clone(), value.clone());
-                                self.enqueue(PersistOp::SetMeta { key, value });
-                            }
-                            None => {
-                                meta.remove(&key);
-                            }
-                        }
+                    for (key, value) in meta_map {
+                        meta.insert(key.clone(), value.clone());
+                        self.enqueue(PersistOp::SetMeta { key, value });
                     }
                 }
 
@@ -486,8 +677,6 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
         match index {
             IndexDefinition::Field(fi) => {
                 let obj = data.as_object();
-
-                // Extract values for each field
                 let new_values: Vec<Option<&Value>> = fi
                     .fields
                     .iter()
@@ -503,48 +692,7 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
                     return Ok(());
                 }
 
-                for record in self.iter_collection(collection) {
-                    if record.deleted {
-                        continue;
-                    }
-                    if exclude_id == Some(record.id.as_str()) {
-                        continue;
-                    }
-
-                    let rec_obj = record.data.as_object();
-                    let matches = fi.fields.iter().enumerate().all(|(i, f)| {
-                        let existing = rec_obj.and_then(|o| o.get(&f.field));
-                        match (existing, new_values[i]) {
-                            (None, None)
-                            | (Some(Value::Null), None)
-                            | (None, Some(Value::Null)) => true,
-                            (Some(a), Some(b)) => a == b,
-                            _ => false,
-                        }
-                    });
-
-                    if matches {
-                        let conflict_value = if fi.fields.len() == 1 {
-                            new_values[0].cloned().unwrap_or(Value::Null)
-                        } else {
-                            Value::Array(
-                                new_values
-                                    .iter()
-                                    .map(|v| v.cloned().unwrap_or(Value::Null))
-                                    .collect(),
-                            )
-                        };
-                        return Err(StorageError::UniqueConstraint {
-                            collection: collection.to_string(),
-                            index: fi.name.clone(),
-                            existing_id: record.id.clone(),
-                            value: conflict_value,
-                        }
-                        .into());
-                    }
-                }
-
-                Ok(())
+                self.check_field_unique(collection, fi, &new_values, exclude_id)
             }
 
             IndexDefinition::Computed(ci) => {
@@ -559,42 +707,12 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
                     return Ok(());
                 }
 
-                for record in self.iter_collection(collection) {
-                    if record.deleted {
-                        continue;
-                    }
-                    if exclude_id == Some(record.id.as_str()) {
-                        continue;
-                    }
-
-                    let rec_computed = record.computed.as_ref();
-                    let existing = rec_computed.and_then(|c| c.get(&ci.name));
-
-                    let matches = match (existing, field_val) {
-                        (None, None) | (Some(Value::Null), None) | (None, Some(Value::Null)) => {
-                            true
-                        }
-                        (Some(a), Some(b)) => a == b,
-                        _ => false,
-                    };
-
-                    if matches {
-                        let conflict_value = field_val.cloned().unwrap_or(Value::Null);
-                        return Err(StorageError::UniqueConstraint {
-                            collection: collection.to_string(),
-                            index: ci.name.clone(),
-                            existing_id: record.id.clone(),
-                            value: conflict_value,
-                        }
-                        .into());
-                    }
-                }
-
-                Ok(())
+                self.check_computed_unique(collection, ci, field_val, exclude_id)
             }
         }
     }
 
+    /// Scan all records across all collections (for init). Not tx-aware.
     fn scan_all_raw(&self) -> Result<Vec<SerializedRecord>> {
         let records = self.records.lock();
         let mut all = Vec::new();
@@ -604,6 +722,7 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
         Ok(all)
     }
 
+    /// Scan all metadata (for init). Not tx-aware.
     fn scan_all_meta(&self) -> Result<Vec<(String, String)>> {
         let meta = self.meta.lock();
         Ok(meta.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -617,6 +736,7 @@ impl<B: StorageBackend> StorageBackend for MemoryMapped<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::types::{FieldIndex, IndexField, IndexSortOrder};
     use crate::storage::sqlite::SqliteBackend;
 
     fn make_record(collection: &str, id: &str, data: Value) -> SerializedRecord {
@@ -644,6 +764,8 @@ mod tests {
         mm
     }
 
+    // ---- Basic CRUD ----
+
     #[test]
     fn put_and_get() {
         let mm = setup();
@@ -656,11 +778,26 @@ mod tests {
     }
 
     #[test]
+    fn put_overwrites_existing() {
+        let mm = setup();
+        let r1 = make_record("users", "u1", serde_json::json!({"name": "Alice"}));
+        mm.put_raw(&r1).unwrap();
+
+        let r2 = make_record("users", "u1", serde_json::json!({"name": "Bob"}));
+        mm.put_raw(&r2).unwrap();
+
+        let fetched = mm.get_raw("users", "u1").unwrap().unwrap();
+        assert_eq!(fetched.data, serde_json::json!({"name": "Bob"}));
+    }
+
+    #[test]
     fn get_missing_returns_none() {
         let mm = setup();
         let fetched = mm.get_raw("users", "nonexistent").unwrap();
         assert!(fetched.is_none());
     }
+
+    // ---- Scan / Count ----
 
     #[test]
     fn scan_excludes_deleted() {
@@ -675,6 +812,30 @@ mod tests {
         let result = mm.scan_raw("users", &ScanOptions::default()).unwrap();
         assert_eq!(result.records.len(), 1);
         assert_eq!(result.records[0].id, "u2");
+    }
+
+    #[test]
+    fn scan_with_offset_and_limit() {
+        let mm = setup();
+        for i in 0..5 {
+            let r = make_record("users", &format!("u{i}"), serde_json::json!({"i": i}));
+            mm.put_raw(&r).unwrap();
+        }
+
+        let result = mm
+            .scan_raw(
+                "users",
+                &ScanOptions {
+                    offset: Some(1),
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.records.len(), 2);
+        // Results are sorted by id: u0, u1, u2, u3, u4 → offset 1 = u1, u2
+        assert_eq!(result.records[0].id, "u1");
+        assert_eq!(result.records[1].id, "u2");
     }
 
     #[test]
@@ -705,6 +866,8 @@ mod tests {
         assert_eq!(mm.count_raw("users").unwrap(), 1);
     }
 
+    // ---- Metadata ----
+
     #[test]
     fn metadata() {
         let mm = setup();
@@ -712,6 +875,8 @@ mod tests {
         assert_eq!(mm.get_meta("key1").unwrap(), Some("value1".to_string()));
         assert_eq!(mm.get_meta("missing").unwrap(), None);
     }
+
+    // ---- Flush / Persistence ----
 
     #[test]
     fn flush_persists_to_inner() {
@@ -731,6 +896,16 @@ mod tests {
         let inner_meta = mm.inner().get_meta("version").unwrap();
         assert_eq!(inner_meta, Some("1".to_string()));
     }
+
+    #[test]
+    fn flush_empty_is_noop() {
+        let mm = setup();
+        assert!(!mm.has_pending_changes());
+        mm.flush().unwrap();
+        assert!(!mm.has_pending_changes());
+    }
+
+    // ---- Transactions ----
 
     #[test]
     fn transaction_commit() {
@@ -761,13 +936,15 @@ mod tests {
         let result: Result<()> = mm.transaction(|backend| {
             let r2 = make_record("users", "u2", serde_json::json!({"name": "Bob"}));
             backend.put_raw(&r2)?;
+            backend.set_meta("tx_key", "tx_value")?;
             Err(crate::error::LessDbError::Internal("rollback".to_string()))
         });
         assert!(result.is_err());
 
-        // Original record still there, tx record rolled back
+        // Original record still there, tx record and meta rolled back
         assert!(mm.get_raw("users", "u1").unwrap().is_some());
         assert!(mm.get_raw("users", "u2").unwrap().is_none());
+        assert_eq!(mm.get_meta("tx_key").unwrap(), None);
     }
 
     #[test]
@@ -791,6 +968,101 @@ mod tests {
     }
 
     #[test]
+    fn transaction_scan_sees_buffer() {
+        let mm = setup();
+        let r1 = make_record("users", "u1", serde_json::json!({"name": "Alice"}));
+        mm.put_raw(&r1).unwrap();
+
+        mm.transaction(|backend| {
+            let r2 = make_record("users", "u2", serde_json::json!({"name": "Bob"}));
+            backend.put_raw(&r2)?;
+
+            let result = backend.scan_raw("users", &ScanOptions::default())?;
+            assert_eq!(result.records.len(), 2);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn transaction_count_sees_buffer() {
+        let mm = setup();
+        let r1 = make_record("users", "u1", serde_json::json!({}));
+        mm.put_raw(&r1).unwrap();
+
+        mm.transaction(|backend| {
+            let r2 = make_record("users", "u2", serde_json::json!({}));
+            backend.put_raw(&r2)?;
+            assert_eq!(backend.count_raw("users")?, 2);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn transaction_meta_sees_buffer() {
+        let mm = setup();
+        mm.set_meta("key", "original").unwrap();
+
+        mm.transaction(|backend| {
+            backend.set_meta("key", "updated")?;
+            assert_eq!(backend.get_meta("key")?, Some("updated".to_string()));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(mm.get_meta("key").unwrap(), Some("updated".to_string()));
+    }
+
+    #[test]
+    fn transaction_batch_put_goes_through_buffer() {
+        let mm = setup();
+
+        mm.transaction(|backend| {
+            let records = vec![
+                make_record("users", "u1", serde_json::json!({"name": "Alice"})),
+                make_record("users", "u2", serde_json::json!({"name": "Bob"})),
+            ];
+            backend.batch_put_raw(&records)?;
+            assert_eq!(backend.count_raw("users")?, 2);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(mm.count_raw("users").unwrap(), 2);
+    }
+
+    #[test]
+    fn nested_transaction_rejected() {
+        let mm = setup();
+        let result: Result<()> = mm.transaction(|backend| backend.transaction(|_inner| Ok(())));
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("nested transactions"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn transaction_commit_enqueues_ops() {
+        let mm = setup();
+        mm.transaction(|backend| {
+            backend.put_raw(&make_record("users", "u1", serde_json::json!({})))?;
+            backend.set_meta("k", "v")?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(mm.has_pending_changes());
+        mm.flush().unwrap();
+        assert!(mm.inner().get_raw("users", "u1").unwrap().is_some());
+        assert_eq!(mm.inner().get_meta("k").unwrap(), Some("v".to_string()));
+    }
+
+    // ---- Batch operations ----
+
+    #[test]
     fn batch_put() {
         let mm = setup();
         let records = vec![
@@ -801,6 +1073,8 @@ mod tests {
         mm.batch_put_raw(&records).unwrap();
         assert_eq!(mm.count_raw("users").unwrap(), 2);
     }
+
+    // ---- Drain ----
 
     #[test]
     fn drain_pending_ops() {
@@ -813,6 +1087,8 @@ mod tests {
         assert_eq!(ops.len(), 2);
         assert!(!mm.has_pending_changes());
     }
+
+    // ---- Load from inner ----
 
     #[test]
     fn load_from_inner_populates_memory() {
@@ -835,5 +1111,253 @@ mod tests {
 
         let meta = mm.get_meta("test_key").unwrap();
         assert_eq!(meta, Some("test_value".to_string()));
+    }
+
+    // ---- Purge tombstones ----
+
+    #[test]
+    fn purge_tombstones_dry_run() {
+        let mm = setup();
+        let mut r1 = make_record("users", "u1", serde_json::json!({}));
+        r1.deleted = true;
+        r1.deleted_at = Some("2020-01-01T00:00:00Z".to_string());
+        mm.put_raw(&r1).unwrap();
+
+        let count = mm
+            .purge_tombstones_raw(
+                "users",
+                &PurgeTombstonesOptions {
+                    older_than_seconds: None,
+                    dry_run: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        // Record should still be there
+        assert!(mm.get_raw("users", "u1").unwrap().is_some());
+    }
+
+    #[test]
+    fn purge_tombstones_removes_deleted_records() {
+        let mm = setup();
+        let mut r1 = make_record("users", "u1", serde_json::json!({}));
+        r1.deleted = true;
+        r1.deleted_at = Some("2020-01-01T00:00:00Z".to_string());
+        let r2 = make_record("users", "u2", serde_json::json!({}));
+        mm.put_raw(&r1).unwrap();
+        mm.put_raw(&r2).unwrap();
+
+        let count = mm
+            .purge_tombstones_raw(
+                "users",
+                &PurgeTombstonesOptions {
+                    older_than_seconds: None,
+                    dry_run: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(mm.get_raw("users", "u1").unwrap().is_none());
+        assert!(mm.get_raw("users", "u2").unwrap().is_some());
+    }
+
+    #[test]
+    fn purge_tombstones_respects_older_than() {
+        let mm = setup();
+        let mut r1 = make_record("users", "u1", serde_json::json!({}));
+        r1.deleted = true;
+        // Use current time so it's NOT older than the threshold
+        r1.deleted_at = Some(chrono::Utc::now().to_rfc3339());
+        mm.put_raw(&r1).unwrap();
+
+        let count = mm
+            .purge_tombstones_raw(
+                "users",
+                &PurgeTombstonesOptions {
+                    older_than_seconds: Some(3600), // 1 hour
+                    dry_run: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(mm.get_raw("users", "u1").unwrap().is_some());
+    }
+
+    #[test]
+    fn purge_tombstones_flushes_to_inner() {
+        let mm = setup();
+        let mut r1 = make_record("users", "u1", serde_json::json!({}));
+        r1.deleted = true;
+        r1.deleted_at = Some("2020-01-01T00:00:00Z".to_string());
+        mm.put_raw(&r1).unwrap();
+        mm.flush().unwrap();
+
+        // Verify inner has the record
+        assert!(mm.inner().get_raw("users", "u1").unwrap().is_some());
+
+        // Purge + flush
+        mm.purge_tombstones_raw(
+            "users",
+            &PurgeTombstonesOptions {
+                older_than_seconds: None,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        mm.flush().unwrap();
+
+        // Inner backend should also have purged
+        // (inner's purge_tombstones_raw is called during flush)
+        assert!(mm.inner().get_raw("users", "u1").unwrap().is_none());
+    }
+
+    #[test]
+    fn purge_tombstones_rejected_in_transaction() {
+        let mm = setup();
+        let result: Result<()> = mm.transaction(|backend| {
+            backend.purge_tombstones_raw(
+                "users",
+                &PurgeTombstonesOptions {
+                    older_than_seconds: None,
+                    dry_run: false,
+                },
+            )?;
+            Ok(())
+        });
+        assert!(result.is_err());
+    }
+
+    // ---- Unique constraint ----
+
+    fn make_field_index(
+        name: &str,
+        fields: &[&str],
+        unique: bool,
+        sparse: bool,
+    ) -> IndexDefinition {
+        IndexDefinition::Field(FieldIndex {
+            name: name.to_string(),
+            fields: fields
+                .iter()
+                .map(|f| IndexField {
+                    field: f.to_string(),
+                    order: IndexSortOrder::Asc,
+                })
+                .collect(),
+            unique,
+            sparse,
+        })
+    }
+
+    #[test]
+    fn check_unique_field_detects_conflict() {
+        let mm = setup();
+        let r1 = make_record(
+            "users",
+            "u1",
+            serde_json::json!({"email": "alice@test.com"}),
+        );
+        mm.put_raw(&r1).unwrap();
+
+        let index = make_field_index("email_idx", &["email"], true, false);
+        let data = serde_json::json!({"email": "alice@test.com"});
+        let result = mm.check_unique("users", &index, &data, None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_unique_field_allows_different_values() {
+        let mm = setup();
+        let r1 = make_record(
+            "users",
+            "u1",
+            serde_json::json!({"email": "alice@test.com"}),
+        );
+        mm.put_raw(&r1).unwrap();
+
+        let index = make_field_index("email_idx", &["email"], true, false);
+        let data = serde_json::json!({"email": "bob@test.com"});
+        let result = mm.check_unique("users", &index, &data, None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_unique_field_excludes_self() {
+        let mm = setup();
+        let r1 = make_record(
+            "users",
+            "u1",
+            serde_json::json!({"email": "alice@test.com"}),
+        );
+        mm.put_raw(&r1).unwrap();
+
+        let index = make_field_index("email_idx", &["email"], true, false);
+        let data = serde_json::json!({"email": "alice@test.com"});
+        // Exclude u1 (self-update)
+        let result = mm.check_unique("users", &index, &data, None, Some("u1"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_unique_field_sparse_skips_null() {
+        let mm = setup();
+        let r1 = make_record("users", "u1", serde_json::json!({}));
+        mm.put_raw(&r1).unwrap();
+
+        let index = make_field_index("email_idx", &["email"], true, true);
+        let data = serde_json::json!({}); // no email field
+        let result = mm.check_unique("users", &index, &data, None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_unique_field_non_sparse_null_conflicts() {
+        let mm = setup();
+        // Two records both missing "email" on a non-sparse unique index should conflict
+        let r1 = make_record("users", "u1", serde_json::json!({}));
+        mm.put_raw(&r1).unwrap();
+
+        let index = make_field_index("email_idx", &["email"], true, false);
+        let data = serde_json::json!({}); // no email field
+        let result = mm.check_unique("users", &index, &data, None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn check_unique_skips_deleted_records() {
+        let mm = setup();
+        let mut r1 = make_record(
+            "users",
+            "u1",
+            serde_json::json!({"email": "alice@test.com"}),
+        );
+        r1.deleted = true;
+        mm.put_raw(&r1).unwrap();
+
+        let index = make_field_index("email_idx", &["email"], true, false);
+        let data = serde_json::json!({"email": "alice@test.com"});
+        let result = mm.check_unique("users", &index, &data, None, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn check_unique_sees_tx_buffer() {
+        let mm = setup();
+        let index = make_field_index("email_idx", &["email"], true, false);
+
+        let result: Result<()> = mm.transaction(|backend| {
+            let r1 = make_record(
+                "users",
+                "u1",
+                serde_json::json!({"email": "alice@test.com"}),
+            );
+            backend.put_raw(&r1)?;
+
+            let data = serde_json::json!({"email": "alice@test.com"});
+            let result = backend.check_unique("users", &index, &data, None, None);
+            assert!(result.is_err());
+            Ok(())
+        });
+        assert!(result.is_ok());
     }
 }
